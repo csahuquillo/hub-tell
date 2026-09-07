@@ -1,0 +1,70 @@
+#!/bin/bash
+# hub-tell <slot> <message...>
+# Writes a message as a user turn into another Claude Code session's tmux
+# pane on the same machine (no network involved, everything is local).
+set -euo pipefail
+
+if [ $# -lt 2 ]; then
+  echo "Usage: hub-tell <slot> <message>" >&2
+  exit 1
+fi
+
+TARGET="$1"; shift
+SESSION="slot-${TARGET}"
+MSG="$*"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/hub-tell/hub-tell.log"
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  echo "ERROR: session '$SESSION' does not exist (is slot '$TARGET' open?)" >&2
+  exit 1
+fi
+
+# Claude Code's compose box is whatever sits between the last two
+# horizontal-rule (────) lines of the pane. If it already has text (an
+# unsent draft - common if you type from a phone/Remote Control client and
+# never hit enter), we must NOT write on top of it: it would get
+# concatenated with the new message and Enter would submit both as
+# nonsense. Abort instead of risking that - this happens more often than
+# you'd think, see README.
+PANE="$(tmux capture-pane -t "$SESSION" -p)"
+BOX="$(printf '%s\n' "$PANE" | awk '
+  /^─+$/ { seps[++n] = NR }
+  { lines[NR] = $0 }
+  END {
+    if (n < 2) { print "NO_BOX_FOUND"; exit }
+    start = seps[n-1]; end = seps[n]
+    out = ""
+    for (i = start+1; i < end; i++) out = out lines[i] "\n"
+    printf "%s", out
+  }
+')"
+
+if [ "$BOX" = "NO_BOX_FOUND" ]; then
+  echo "ERROR: could not locate the compose box for '$SESSION', aborting to be safe" >&2
+  exit 1
+fi
+
+# The first line may be the placeholder hint Claude Code shows when the
+# box is empty (e.g. Try "fix lint errors"), not real user text - that
+# doesn't count as "busy". We don't match the prompt glyph itself (avoids
+# locale/encoding headaches when this runs over SSH/SSM): matching the
+# ASCII hint pattern is enough and far more portable.
+FIRST_LINE="$(printf '%s\n' "$BOX" | head -n1)"
+REST_LINES="$(printf '%s\n' "$BOX" | tail -n +2 | tr -d '[:space:]')"
+
+if printf '%s' "$FIRST_LINE" | grep -qE 'Try ".*"[[:space:]]*$' && [ -z "$REST_LINES" ]; then
+  : # box is genuinely empty (just the placeholder) -> proceed
+else
+  echo "ERROR: '$SESSION' already has unsent text in its compose box, aborting" >&2
+  exit 1
+fi
+
+FROM="$(tmux display-message -p '#S' 2>/dev/null || echo unknown)"
+
+tmux send-keys -t "$SESSION" -l "[hub-tell from ${FROM}] ${MSG}"
+sleep 1
+tmux send-keys -t "$SESSION" Enter
+
+mkdir -p "$(dirname "$LOG")"
+printf '%s FROM=%s TO=%s MSG=%s\n' "$(date -Iseconds)" "$FROM" "$SESSION" "$MSG" >> "$LOG"
+echo "Sent to ${SESSION}."
