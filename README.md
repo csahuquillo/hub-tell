@@ -70,24 +70,62 @@ compares the compose box against the placeholder hint Claude Code shows when
 it's genuinely empty (e.g. `Try "fix lint errors"`), and refuses to send if
 there's real text there instead.
 
-## Limitations / roadmap
+## Limitations
 
 - **Same machine only.** This only works between sessions that share a
   `tmux` server, i.e. sessions on the same host. It does **not** reach
-  sessions running on a different machine (say, your laptop vs. a cloud
-  host), different operating systems, or other Claude Code clients in
-  general.
-- **Bridging across machines is the planned next step.** Claude Code does
-  have a native cross-session messaging mechanism (`ListAgents` /
-  `SendMessage`) that in principle could cover this, but getting it to fire
-  reliably from an injected instruction needs more work - it's blocked by
-  Claude Code's own auto-mode safety classifier when invoked that way. Until
-  that's sorted out, `hub-tell` stays local-only. Contributions or ideas on
-  this are welcome.
+  sessions running on a different machine, different operating systems, or
+  other Claude Code clients in general.
 - The compose-box detection is a text-pattern heuristic against
   `tmux capture-pane` output, not an API — it's been reliable in practice
   but could in principle be thrown off by an unusual terminal width or a
   future Claude Code UI change.
+- `HUB_TELL_FROM=<name>` overrides the auto-detected sender. Set this when
+  invoking `hub-tell` from outside a real tmux session (e.g. over SSH from
+  a script) - `tmux display-message` isn't reliable there.
+
+## Bridging across machines: what we found
+
+The obvious next step is reaching a session on a *different* machine (your
+laptop, say, talking to the server above). Three options, in the order we
+actually evaluated them:
+
+1. **Claude Code's native cross-session messaging** (`ListAgents` /
+   `SendMessage`) — in principle this is exactly built for this. In
+   practice, invoking `SendMessage` from an injected instruction gets
+   blocked by Claude Code's own auto-mode safety classifier every time we
+   tried, regardless of phrasing. That reads as a deliberate guardrail
+   (stopping an injected instruction from making a session message other
+   agents on its own), not a bug — so we stopped trying to work around it.
+2. **Real remote access to the other machine** (SSH, an agent) — technically
+   the most direct fix, but it means opening your personal laptop up to
+   remote access just for this. That's a real change in attack surface, not
+   "just another script," so we didn't do it by default.
+3. **What we actually use**: when a human is present with a session on the
+   *other* machine, that session already has access to both sides (its own
+   local environment plus however it reaches the server) and can relay a
+   message on request — see the `hub_tell_remote.py`-style pattern below.
+   It's not 24/7 automatic delivery, but it needs no new infrastructure and
+   doesn't touch anyone's attack surface.
+
+If you want a fully automatic bridge with no session in the loop, the
+realistic shape for that is an async mailbox (the server writes a pending
+message somewhere, a session on the other machine checks it on startup) —
+we haven't built this, since our own use case didn't need 24/7 delivery.
+
+### Relay pattern (option 3)
+
+Not included as a ready-made script here since it depends on how you reach
+your server (SSH, a cloud provider's session-manager equivalent, etc.), but
+the shape is: from a session on machine B, run whatever gets you a shell on
+machine A, then invoke `hub-tell` there with `HUB_TELL_FROM` set to
+something that identifies machine B, e.g.:
+
+```bash
+ssh host-a "HUB_TELL_FROM=laptop /home/you/bin/hub-tell backend 'ready for review'"
+```
+
+Contributions turning this into a proper option in the script are welcome.
 
 ## License
 

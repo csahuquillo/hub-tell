@@ -59,7 +59,7 @@ else
   exit 1
 fi
 
-FROM="$(tmux display-message -p '#S' 2>/dev/null || echo unknown)"
+FROM="${HUB_TELL_FROM:-$(tmux display-message -p '#S' 2>/dev/null || echo unknown)}"
 
 tmux send-keys -t "$SESSION" -l "[hub-tell from ${FROM}] ${MSG}"
 sleep 1
