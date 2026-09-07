@@ -1,0 +1,28 @@
+# Example: add this to the global ~/.claude/CLAUDE.md on your multi-session host
+
+Copy the section below into `~/.claude/CLAUDE.md` on the machine that hosts
+your Claude Code sessions/slots. Claude Code loads that file automatically
+into every session for that user, so any slot that starts up will know
+`hub-tell` exists without you having to explain it each time.
+
+---
+
+## Messaging between sessions on this host
+
+If you need to notify or ask something of ANOTHER Claude Code session
+running on this same machine (e.g. "let the deploy session know X is
+live"), use:
+
+    hub-tell <session-name> "<message>"
+
+Example: `hub-tell backend "Deploy finished, please check the logs"`.
+
+- `<session-name>` is the short name (without the `slot-` prefix), e.g.
+  `backend`, `docs`, `01`.
+- The message arrives as a normal user turn in that session's conversation,
+  prefixed with `[hub-tell from <your-session>]` so it knows where it came
+  from.
+- If the target session doesn't exist (not open), `hub-tell` fails with a
+  clear error instead of doing nothing silently.
+- This only works for sessions on THIS machine - it does not reach other
+  hosts, other operating systems, or unrelated Claude Code clients.
