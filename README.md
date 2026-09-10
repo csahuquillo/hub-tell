@@ -1,7 +1,9 @@
 # hub-tell
 
-A tiny script that lets multiple [Claude Code](https://claude.com/claude-code)
-sessions running on the same machine send each other messages, safely.
+A small local message bus for coordinating [Claude Code](https://claude.com/claude-code)
+and Codex sessions running on the same machine. Claude and Codex keep their own
+contexts and permissions, while `hub-tell` lets them exchange tasks, checks and
+results safely.
 
 If you run several long-lived Claude Code sessions on one server — each one
 its own project or automation, kept alive in `tmux` and reachable via
@@ -39,6 +41,26 @@ the hood.
    into that machine's `~/.claude/CLAUDE.md`, so every session that starts up
    there already knows `hub-tell` exists and how to use it - you don't have
    to explain it to each one by hand.
+
+## Claude ↔ Codex
+
+The host integration accepts both Claude destinations and Codex slots. Claude
+can send work to Codex with the `codex:` prefix:
+
+```bash
+hub-tell codex:auditoria "Revisa los logs del despliegue y devuelve un resumen"
+```
+
+Codex can send a follow-up back to Claude by targeting its Claude slot:
+
+```bash
+HUB_TELL_FROM=codex:auditoria hub-tell operaciones "La revisión ha terminado: todo OK"
+```
+
+Messages to Codex are dispatched in the background and are serialized by the
+slot lock/queue. A receiving agent can reply using `hub-tell` or the durable
+`hub-bus` envelope described below. This is coordination between independent
+agents, not a shared model context or shared credential store.
 
 ## Usage
 
