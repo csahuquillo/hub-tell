@@ -42,6 +42,25 @@ the hood.
 
 ## Usage
 
+### Durable correlated messages
+
+For task assignment across Claude and Codex runtimes, the repository also
+includes `hub-bus`. It persists a validated message envelope and supports
+acknowledgements, correlated results, failures, and blocked handoffs:
+
+```bash
+./hub-bus send codex:worker "Check the deployment" --from claude:maestro
+./hub-bus inbox codex:worker
+./hub-bus ack <message-id> --by codex:worker
+./hub-bus complete <message-id> --by codex:worker --result "OK"
+./hub-bus status
+```
+
+The bus stores state under `${HUB_BUS_STATE:-~/.local/state/hub-bus}` with
+private permissions, atomic writes, strict name validation, and a 32,000
+character message limit. Do not put credentials or confidential data in
+messages. Run `python3 -m unittest -v test_hub_bus.py` to execute its tests.
+
 From inside any session (as a normal shell command it can run):
 
 ```bash
