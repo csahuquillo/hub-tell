@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Claude Code SessionStart hook for slots started by slot-run.
+#
+# Stores the current session_id in $HUB_SLOT_SESSIONS/<slot>.session (default
+# ~/.claude/slot-sessions) so that, after /clear or a compaction starts a new
+# session id, the next restart of the slot resumes the NEW conversation instead
+# of the old one.
+#
+# Only acts inside a slot (tmux session "slot-<name>"); elsewhere it is a no-op.
+# Reads the hook payload (JSON) from stdin.
+[ -n "${TMUX:-}" ] || exit 0
+tm=$(tmux display-message -p -t "${TMUX_PANE:-}" '#S' 2>/dev/null) || exit 0
+case "$tm" in slot-?*) name="${tm#slot-}" ;; *) exit 0 ;; esac
+[[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || exit 0
+sid=$(python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("session_id") or "")
+except Exception: pass' 2>/dev/null)
+[[ "$sid" =~ ^[0-9a-f-]{36}$ ]] || exit 0
+dir="${HUB_SLOT_SESSIONS:-$HOME/.claude/slot-sessions}"
+f="$dir/$name.session"
+[ "$(tr -d ' \n\r' < "$f" 2>/dev/null)" = "$sid" ] && exit 0
+mkdir -p "$dir" && printf '%s\n' "$sid" > "$f.tmp" && mv "$f.tmp" "$f"
+exit 0

@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# slot-run <name> - run a long-lived Claude Code "slot" inside tmux, with
+# deterministic resume of ITS OWN conversation after any restart.
+#
+# - Session id per slot: $HUB_SLOT_SESSIONS/<name>.session (default
+#   ~/.claude/slot-sessions). First start generates a uuid and launches with
+#   --session-id; later starts use --resume <uuid>. A blind --continue would
+#   resume the most recent conversation of the working directory, which may
+#   belong to another slot. slot-session-hook keeps the file current after
+#   /clear or compaction.
+# - tmux session "slot-<name>" provides the PTY, makes the slot reachable by
+#   hub-tell, and lets the babysitter loop below answer interactive dialogs
+#   nobody can answer from a phone.
+# - The session gets --name slot-<name> (stable peer name for native
+#   ListAgents/SendMessage) and the hub-bridge channel (--mcp-config +
+#   --dangerously-load-development-channels server:hub-bridge).
+# - Designed to be the main process of a systemd unit: if claude/tmux dies the
+#   script exits 1 and Restart=always relaunches it, resuming the same
+#   conversation.
+#
+# Environment (all optional):
+#   HUB_SLOT_CWD            working directory of the session (default: $HOME)
+#   HUB_SLOT_SESSIONS       where <name>.session files live
+#   HUB_SLOT_REMOTE_CONTROL 1 (default) to add --remote-control <prefix><name>
+#   HUB_RC_PREFIX           Remote Control session name prefix (default: hub-)
+#   HUB_SLOT_EXTRA_ARGS     extra arguments appended to the claude command
+#   HUB_SLOT_CONFIG_DIR     CLAUDE_CONFIG_DIR for this slot (default: inherited)
+#   HUB_BRIDGE_STATE        channel sockets and per-slot MCP configs
+#   HUB_PYTHON              python interpreter for the channel (default: python3)
+set -uo pipefail
+name="${1:?usage: slot-run <name>}"
+if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+  echo "slot-run: invalid slot name '$name'" >&2
+  exit 2
+fi
+
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+WORKDIR="${HUB_SLOT_CWD:-$HOME}"
+BRIDGE_DIR="${HUB_BRIDGE_STATE:-$HOME/.local/state/hub-bridge}"
+mkdir -p "$BRIDGE_DIR"; chmod 700 "$BRIDGE_DIR"
+MCP_CONFIG="$BRIDGE_DIR/$name.mcp.json"
+BRIDGE_SCRIPT="${HUB_BRIDGE_CHANNEL_SCRIPT:-$SCRIPT_DIR/bridge/hub_bridge_channel.py}"
+PYTHON="${HUB_PYTHON:-$(command -v python3 || echo python3)}"
+
+# Per-slot MCP config for the hub-bridge channel (mode 0600).
+"$PYTHON" - "$MCP_CONFIG" "$PYTHON" "$BRIDGE_SCRIPT" "$name" "$BRIDGE_DIR" \
+  "${HUB_CODEX_COMMAND:-$SCRIPT_DIR/hub-codex}" "${HUB_BUS_COMMAND:-$SCRIPT_DIR/hub-bus}" <<'PY'
+import json, os, sys
+config, python, script, slot, bridge_state, hub_codex, hub_bus = sys.argv[1:]
+value = {"mcpServers": {"hub-bridge": {"type": "stdio", "command": python, "args": [script], "env": {
+    "HUB_SLOT": slot, "HUB_BRIDGE_STATE": bridge_state,
+    "HUB_CODEX_COMMAND": hub_codex, "HUB_BUS_COMMAND": hub_bus}}}}
+fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    json.dump(value, stream)
+os.chmod(config, 0o600)
+PY
+
+STATE_DIR="${HUB_SLOT_SESSIONS:-$HOME/.claude/slot-sessions}"
+mkdir -p "$STATE_DIR"
+STATE="$STATE_DIR/$name.session"
+CONFIG_DIR="${HUB_SLOT_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+# Claude Code stores transcripts under projects/<cwd with every
+# non-alphanumeric character replaced by "-">/<session-id>.jsonl
+PROJECT_KEY="$(printf '%s' "$WORKDIR" | sed 's/[^A-Za-z0-9]/-/g')"
+TM="slot-$name"
+
+args=(claude)
+if [ "${HUB_SLOT_REMOTE_CONTROL:-1}" = "1" ]; then
+  args+=(--remote-control "${HUB_RC_PREFIX:-hub-}$name")
+fi
+if [ -s "$STATE" ]; then
+  sid="$(tr -d ' \n\r' < "$STATE")"
+  if [ -s "$CONFIG_DIR/projects/$PROJECT_KEY/$sid.jsonl" ]; then
+    args+=(--resume "$sid")
+  else
+    # Known id but no transcript yet (slot opened and never used): --resume
+    # would fail with "No conversation found" and the unit would loop.
+    args+=(--session-id "$sid")
+  fi
+else
+  sid="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
+  printf '%s\n' "$sid" > "$STATE"
+  args+=(--session-id "$sid")
+fi
+args+=(--name "slot-$name" --mcp-config "$MCP_CONFIG"
+       --dangerously-load-development-channels server:hub-bridge)
+# shellcheck disable=SC2206  # intentional word splitting of user-provided extra args
+[ -z "${HUB_SLOT_EXTRA_ARGS:-}" ] || args+=(${HUB_SLOT_EXTRA_ARGS})
+CMD="$(printf '%q ' "${args[@]}")"
+
+# A new tmux session inherits the tmux SERVER's global environment, not this
+# process's, so pass what the slot needs explicitly with -e.
+TMUX_ENV=(-e "HUB_SLOT=$name")
+[ -z "${HUB_SLOT_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-}}" ] || TMUX_ENV+=(-e "CLAUDE_CONFIG_DIR=$CONFIG_DIR")
+
+tmux kill-session -t "=$TM" 2>/dev/null || true
+tmux new-session -d -s "$TM" -x 220 -y 50 -c "$WORKDIR" "${TMUX_ENV[@]}" "$CMD"
+
+cleanup() { tmux kill-session -t "=$TM" 2>/dev/null; exit 0; }
+trap cleanup TERM INT
+
+# Babysitter: keep the unit alive while the session exists and answer the
+# dialogs that would otherwise leave a remote-controlled slot stuck.
+while tmux has-session -t "=$TM" 2>/dev/null; do
+  # Drop blank lines: dialogs leave dozens of empty lines below them and a
+  # plain tail would never see the text.
+  pane=$(tmux capture-pane -t "=$TM:" -p 2>/dev/null | grep -v '^[[:space:]]*$' | tail -12)
+  if printf '%s' "$pane" | grep -q "Resume from summary"; then
+    # Resume menu: option 2 = resume the full session as-is (lose nothing).
+    # This menu does not persist "don't ask again", so answer it every time.
+    tmux send-keys -t "=$TM:" Down Enter
+    sleep 3
+  elif printf '%s' "$pane" | grep -q "Yes, I trust this folder"; then
+    # Workspace trust dialog (first time Claude opens this directory).
+    tmux send-keys -t "=$TM:" Down Enter
+    sleep 3
+  elif printf '%s' "$pane" | grep -q "Teach auto mode about your environment"; then
+    # The auto-mode setup wizard cannot be completed over Remote Control and
+    # leaves the slot unresponsive: cancel it.
+    tmux send-keys -t "=$TM:" Escape
+    sleep 3
+  elif printf '%s' "$pane" | grep -q "I am using this for local development"; then
+    # Development-channel confirmation: Enter accepts option 1. Match the menu
+    # option, not the flag name: the "restart without
+    # --dangerously-load-development-channels" notice stays on screen after
+    # accepting, and matching it would press Enter every few seconds (sending
+    # whatever is in the compose box).
+    tmux send-keys -t "=$TM:" Enter
+    sleep 3
+  fi
+  sleep 3
+done
+exit 1

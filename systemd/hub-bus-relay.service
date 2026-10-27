@@ -1,0 +1,24 @@
+# User unit for the relay that delivers queued hub-bus messages and serves the
+# claim/identity broker socket for sandboxed Codex turns.
+#   systemctl --user enable --now hub-bus-relay
+[Unit]
+Description=Deliver queued Claude/Codex hub-bus messages
+After=default.target
+
+[Service]
+Type=simple
+Environment=HUB_CODEX_COMMAND=%h/.local/bin/hub-codex
+Environment=HUB_BUS_COMMAND=%h/.local/bin/hub-bus
+Environment=HUB_TELL_COMMAND=%h/.local/bin/hub-tell
+# Optional reservation backend (see README, "Claims"):
+# Environment=HUB_CLAIM_COMMAND=%h/.local/bin/my-claim-tool
+ExecStart=%h/.local/bin/hub-codex relay
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-%h/.local/state/hub-bus -%h/.local/state/hub-bridge -%h/.local/state/hub-codex -%h/.local/state/hub-tell
+
+[Install]
+WantedBy=default.target
