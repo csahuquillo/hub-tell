@@ -1,0 +1,16 @@
+# Example user unit: start the Codex App Server daemon (with remote control) at login/boot.
+# hub-codex talks to it over $CODEX_HOME/app-server-control/app-server-control.sock.
+#   systemctl --user enable --now codex-app-server
+[Unit]
+Description=Codex app-server daemon with remote control
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/env codex app-server daemon bootstrap --remote-control
+TimeoutStartSec=120
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

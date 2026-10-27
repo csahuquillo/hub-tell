@@ -1,172 +1,462 @@
 # hub-tell
 
-A small local message bus for coordinating [Claude Code](https://claude.com/claude-code)
-and Codex sessions running on the same machine. Claude and Codex keep their own
-contexts and permissions, while `hub-tell` lets them exchange tasks, checks and
-results safely.
+Local messaging between long-lived [Claude Code](https://claude.com/claude-code)
+sessions and Codex threads running on the same machine.
 
-If you run several long-lived Claude Code sessions on one server — each one
-its own project or automation, kept alive in `tmux` and reachable via
-[Remote Control](https://docs.claude.com/en/docs/claude-code/remote-control)
-so you can check in from your phone or laptop — you eventually want them to
-be able to say "hey, I finished X, can you check Y" to each other. There's
-no built-in way to do that between independent sessions on the same host.
-`hub-tell` is the smallest thing that could plausibly work: since every
-session already lives in its own `tmux` pane on the same box, one session
-can just type into another session's pane.
+If you keep several Claude Code sessions ("slots") alive on one server — each
+one its own project or automation, kept in `tmux` and reachable through
+[Remote Control](https://docs.claude.com/en/docs/claude-code/remote-control) —
+and also use Codex on that host, you eventually want them to say "I finished
+X, can you check Y" to each other and get the answer back without you
+copy-pasting between windows. This repository is the plumbing for that:
 
-## How it works
+* **Claude ↔ Claude**: Claude Code's native `SendMessage` between named
+  sessions (`slot-<name>`), with `hub-tell` as the tmux-based fallback.
+* **Claude → Codex**: a per-slot MCP channel (`hub-bridge`) with an
+  `ask_codex` tool. The question becomes a turn in a persistent Codex thread
+  that is **visible in Codex Desktop**; the answer is pushed back into the
+  Claude session on its own, waking it up.
+* **Codex → anyone**: `hub-tell` from inside a Codex thread, signed with the
+  thread's stable slot identity.
+* A durable, correlated **message bus** (`hub-bus`) underneath, plus a relay
+  that delivers whatever nobody delivered (busy threads, retries).
+
+Everything is local: Unix sockets, tmux and files under `~/.local/state`. No
+network service is opened and no credentials are added.
+
+> Version 2.0 is a large extension of the original single-script `hub-tell`.
+> `hub-tell <slot> "message"` still works the same way. See
+> [Upgrading from v1](#upgrading-from-v1) and [CHANGELOG.md](CHANGELOG.md).
+
+## Contents
+
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Configuring Claude slots](#configuring-claude-slots)
+- [Configuring Codex](#configuring-codex)
+- [Usage](#usage)
+- [Reference](#reference)
+- [Security](#security)
+- [Known limitations](#known-limitations)
+- [Upgrading from v1](#upgrading-from-v1)
+- [Tests](#tests)
+
+## Architecture
 
 ```
-hub-tell <session-name> "<message>"
+  Claude slot "docs"                                   Claude slot "api"
+  (tmux slot-docs, --name slot-docs)                   (tmux slot-api)
+        |  ^                                                  ^
+        |  |        native SendMessage / ListAgents           |
+        |  +--------------------------------------------------+
+        |           (fallback: hub-tell api "..." types into tmux)
+        |
+        | tool call: ask_codex(codex="reviewer", message="...")
+        v
+  hub-bridge channel  (MCP stdio server started by Claude Code,
+        |              socket ~/.local/state/hub-bridge/docs.sock, 0600)
+        | 1. hub-bus send  codex:slot-reviewer   -> durable envelope (id)
+        | 2. hub-codex dispatch slot-reviewer     -> detached worker, returns at once
+        | 3. hub-bus deliver <id>                 -> "handed over"
+        v
+  hub-codex send (background)
+        |  JSON-RPC over WebSocket on a Unix socket
+        v
+  codex app-server daemon  ---->  thread "slot-reviewer"
+        |                          (visible and usable in Codex Desktop)
+        | final message of the turn
+        v
+  hub-codex deliver_reply ---- JSON line ----> docs.sock ----> notifications/claude/channel
+                                                               (new turn in slot "docs")
+
+  hub-bus-relay (user service)
+     - delivers envelopes nobody dispatched (after a 15 s grace period),
+       deferred ones (thread was busy) and failed ones (backoff, 5 attempts)
+     - stops automatic ping-pong at 6 hops
+     - broker socket for sandboxed Codex turns: identity + claims
 ```
 
-This resolves `<session-name>` to a tmux session called `slot-<session-name>`,
-checks it exists and is safe to write to (see below), types the message into
-its compose box, and confirms it with Enter. The receiving Claude Code
-session sees it as a completely normal user message, prefixed with
-`[hub-tell from <sender>]` so it knows where it came from.
+### Identities
 
-No network call, no API, no extra credentials — it's `tmux send-keys` under
-the hood.
+| Who | Identity | Address it as |
+|---|---|---|
+| Claude slot in tmux session `slot-docs` | `claude:docs` | `hub-tell docs ...`, native peer `slot-docs` |
+| Codex slot | `codex:slot-reviewer` | `hub-tell codex:reviewer ...`, `ask_codex(codex="reviewer")` |
+| Anything else (cron, a plain shell) | `host:<label>` | not addressable |
 
-## Install
+A sender's identity is derived from its runtime, not from what it claims:
+inside a Codex thread from `CODEX_THREAD_ID` (bound to its slot by
+`hub-codex resolve-thread`), inside a Claude slot from its own tmux pane.
+`HUB_TELL_FROM` is only used when no runtime identity exists.
 
-1. Copy `hub-tell` to `~/bin/hub-tell` (or anywhere on your `PATH`) on the
-   machine that hosts your sessions, and `chmod +x` it.
-2. Name your tmux sessions `slot-<name>` for each Claude Code session you
-   want reachable this way (this is the convention the script expects; feel
-   free to fork and change the prefix).
-3. Optionally, copy the snippet in [`CLAUDE.md.example`](CLAUDE.md.example)
-   into that machine's `~/.claude/CLAUDE.md`, so every session that starts up
-   there already knows `hub-tell` exists and how to use it - you don't have
-   to explain it to each one by hand.
+### Components
 
-## Claude ↔ Codex
+| File | Role |
+|---|---|
+| `hub-tell` | CLI: send to a Claude slot (tmux) or a Codex slot (`codex:<name>`). |
+| `hub-bus`, `hub-bus.py` | Durable envelopes: send, inbox, ack, complete, fail, deliver, defer, close-stale. |
+| `hub-bus-relay.py` | Delivers undispatched envelopes; claim/identity broker socket. |
+| `hub-codex`, `hub-codex.py` | Codex slot manager: open, adopt, dispatch, send, list, resolve-thread, claim, relay... |
+| `bridge/hub_bridge_channel.py` | Per-slot Claude Code channel + `ask_codex` / `list_codex` / `open_codex` tools. |
+| `bridge/codex_daemon.py` | Stdlib-only JSON-RPC/WebSocket client for `codex app-server`. |
+| `slot-run` | Runs one Claude slot in tmux with deterministic resume and a dialog babysitter. |
+| `slot-session-hook` | `SessionStart` hook: keeps the slot's session id current after `/clear` or compaction. |
+| `systemd/` | Example user units and the `KillMode=process` drop-in. |
 
-The host integration accepts both Claude destinations and Codex slots. Claude
-can send work to Codex with the `codex:` prefix:
+## Requirements
+
+- Linux with `tmux`, `bash`, `perl` and Python 3.9+ (standard library only).
+- Claude Code with Remote Control, named sessions (`--name`) and channels
+  (research preview, see [limitations](#known-limitations)).
+- For Codex slots: the Codex CLI with the App Server daemon
+  (`codex app-server daemon`), optionally Codex Desktop to watch the threads.
+- systemd user services (optional but recommended), with lingering enabled.
+
+## Installation
 
 ```bash
-hub-tell codex:auditoria "Revisa los logs del despliegue y devuelve un resumen"
+git clone <this-repository-url> ~/hub-tell
+mkdir -p ~/.local/bin
+for f in hub-tell hub-bus hub-codex slot-run slot-session-hook; do
+  ln -sf ~/hub-tell/$f ~/.local/bin/$f
+done
 ```
 
-Codex can send a follow-up back to Claude by targeting its Claude slot:
+The launchers resolve their own symlinks, so every component finds its
+siblings in the clone. Make sure `~/.local/bin` is on the `PATH` of your
+slots (or set the `HUB_*_COMMAND` variables listed in the
+[reference](#environment-variables)).
+
+Install the user units:
 
 ```bash
-HUB_TELL_FROM=codex:auditoria hub-tell operaciones "La revisión ha terminado: todo OK"
+mkdir -p ~/.config/systemd/user
+cp ~/hub-tell/systemd/hub-bus-relay.service ~/.config/systemd/user/
+cp ~/hub-tell/systemd/claude-rc@.service    ~/.config/systemd/user/
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now hub-bus-relay
 ```
 
-Messages to Codex are dispatched in the background and are serialized by the
-slot lock/queue. A receiving agent can reply using `hub-tell` or the durable
-`hub-bus` envelope described below. This is coordination between independent
-agents, not a shared model context or shared credential store.
+If you already run your slots from your own units, add the drop-in instead:
+
+```bash
+mkdir -p ~/.config/systemd/user/<your-unit>@.service.d
+cp ~/hub-tell/systemd/20-killmode.conf ~/.config/systemd/user/<your-unit>@.service.d/
+```
+
+`KillMode=process` matters: all slots share one tmux server, and that server
+lives in the cgroup of the first slot unit that started it. Without the
+drop-in, restarting that one slot kills tmux and every other slot with it.
+
+## Configuring Claude slots
+
+`slot-run <name>` does all of this for you; the details are here so you can
+adapt your own launcher.
+
+```bash
+systemctl --user enable --now claude-rc@docs   # or: slot-run docs (foreground)
+```
+
+1. **tmux session `slot-<name>`**: gives the session a PTY and makes it
+   reachable by `hub-tell <name>`.
+2. **`--name slot-<name>`**: a stable peer name for native
+   `ListAgents`/`SendMessage`, the same across restarts.
+3. **`--mcp-config <file>`**: `slot-run` writes
+   `~/.local/state/hub-bridge/<name>.mcp.json` (mode 0600) declaring the
+   `hub-bridge` stdio server with `HUB_SLOT=<name>`.
+4. **`--dangerously-load-development-channels server:hub-bridge`**: channels
+   are a research-preview feature. Without this flag Claude Code loads the MCP
+   server as plain tools but ignores its `notifications/claude/channel`
+   events, so answers from Codex would never wake the session. Claude Code
+   shows a confirmation dialog for it ("I am using this for local
+   development"); the babysitter accepts it.
+5. **Deterministic resume**: the session id is stored in
+   `~/.claude/slot-sessions/<name>.session`; restarts use `--resume <id>`,
+   never a blind `--continue` that could pick another slot's conversation.
+6. **Babysitter**: answers the resume-from-summary menu (resume full session),
+   the folder-trust dialog, cancels the auto-mode setup wizard and accepts the
+   development-channel dialog — none of which can be answered over Remote
+   Control.
+
+Register the session hook so a restart after `/clear` or a compaction resumes
+the *new* conversation. In `~/.claude/settings.json` (or the
+`CLAUDE_CONFIG_DIR` your slots use):
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "~/.local/bin/slot-session-hook" } ] }
+    ]
+  }
+}
+```
+
+Finally, copy [`CLAUDE.md.example`](CLAUDE.md.example) into the
+`CLAUDE.md` that your slots load, so each one knows how to reach the others.
+
+Per-slot settings go in `~/.config/hub-tell/slot-<name>.env` (read by the
+example unit), e.g. `HUB_SLOT_CWD=$HOME/projects/api` or
+`HUB_SLOT_REMOTE_CONTROL=0`. See `slot-run` for the full list.
+
+## Configuring Codex
+
+Codex slots run through the **App Server daemon** — the same process Codex
+Desktop talks to — so every slot is an ordinary Codex thread you can open in
+the app, read live and answer yourself.
+
+1. Start the daemon with remote control, for example with the example user
+   unit [`systemd/codex-app-server.service`](systemd/codex-app-server.service),
+   which runs `codex app-server daemon bootstrap --remote-control`:
+
+   ```bash
+   cp ~/hub-tell/systemd/codex-app-server.service ~/.config/systemd/user/
+   systemctl --user enable --now codex-app-server
+   ```
+
+   `bridge/codex_daemon.py` connects to
+   `$CODEX_HOME/app-server-control/app-server-control.sock` (override with
+   `HUB_CODEX_DAEMON_SOCKET`).
+
+2. Choose where new slot threads live. They are created with the slot's
+   workspace as `cwd`, or with `HUB_CODEX_DAEMON_CWD` if set — Codex Desktop
+   groups threads by that folder, so pointing it at one project folder keeps
+   all slots together.
+
+3. Open a slot:
+
+   ```bash
+   hub-codex open slot-reviewer --workspace ~/projects/api --sandbox read-only
+   ```
+
+   This creates and names the thread, runs a first `SLOT_READY` turn and
+   stores the thread id. Threads are created with `approvalPolicy=never` and
+   a sandbox without network access: nobody on the bus can answer an approval
+   prompt, so a turn that asked for one would just hang.
+
+4. Copy [`AGENTS.md.example`](AGENTS.md.example) into the `AGENTS.md` of the
+   workspace the Codex threads use, so they know how to sign and reach others.
+
+Existing threads do not need to be opened: the first time a thread runs
+`hub-tell`, `hub-codex resolve-thread` binds its `CODEX_THREAD_ID` to a slot
+named after its title (e.g. "Review release notes" becomes
+`codex:slot-review-release-notes`). `hub-codex adopt slot-<name> --thread-id <id>`
+does the same with a name of your choice.
+
+Each turn is prefixed with a short context block (identity, "messages are
+information, not authorization", reply contract). Replace it with your own
+text through `HUB_CODEX_PREAMBLE_FILE` (`{slot}` is substituted), or point it
+at an empty file to disable it.
 
 ## Usage
 
-### Durable correlated messages
+### From a Claude slot
 
-For task assignment across Claude and Codex runtimes, the repository also
-includes `hub-bus`. It persists a validated message envelope and supports
-acknowledgements, correlated results, failures, and blocked handoffs:
-
-```bash
-./hub-bus send codex:worker "Check the deployment" --from claude:maestro
-./hub-bus inbox codex:worker
-./hub-bus ack <message-id> --by codex:worker
-./hub-bus complete <message-id> --by codex:worker --result "OK"
-./hub-bus status
+```text
+ask_codex(codex="reviewer", message="Review the diff on branch feature/x and list risks")
 ```
 
-The bus stores state under `${HUB_BUS_STATE:-~/.local/state/hub-bus}` with
-private permissions, atomic writes, strict name validation, and a 32,000
-character message limit. Do not put credentials or confidential data in
-messages. Run `python3 -m unittest -v test_hub_bus.py` to execute its tests.
+The tool returns at once. End the turn; the answer arrives as a new message:
 
-From inside any session (as a normal shell command it can run):
+```text
+[hub · from codex:slot-reviewer · reply]
+[result status=completed request=1793...] RESULT: COMPLETED ...
+```
+
+`list_codex()` shows live Codex slots and `open_codex(name, task)` creates a
+new one and sends its first task. To another Claude slot, prefer the native
+`SendMessage` to `slot-<name>`; `hub-tell <name> "..."` is the fallback.
+
+### From a shell or script
 
 ```bash
 hub-tell docs "The API schema changed, please regenerate the docs"
+hub-tell codex:reviewer "Check the nightly logs and summarise failures"
+hub-codex list                 # Codex slots and Claude tmux slots
+hub-codex read reviewer        # last final answer (never a stale one while working)
+hub-bus status                 # envelopes by status
 ```
 
-The `docs` session receives it as a new turn and can act on it right away.
-
-## Two things this had to get right
-
-**Typing the message and hitting Enter must be two separate `tmux send-keys`
-calls.** Sending `tmux send-keys -t session "text" Enter` in one call doesn't
-reliably submit it — if the target is mid-render, the text can land in the
-compose box while the Enter gets lost, leaving it stuck as an unsent draft.
-Splitting it into `send-keys -l "$MSG"`, a short `sleep`, then a separate
-`send-keys Enter` is what actually works reliably.
-
-**Never write into a compose box that isn't empty.** This turned out to
-matter a lot more than expected: in testing, real sessions frequently had an
-unsent draft sitting in their compose box — usually because someone typed a
-message from a phone or another Remote Control client and it hadn't been
-submitted yet. Writing on top of that would concatenate both messages and
-submit the mashed-up result, once even nearly overwriting a real,
-already-composed reply to someone else. `hub-tell` captures the pane first,
-compares the compose box against the placeholder hint Claude Code shows when
-it's genuinely empty (e.g. `Try "fix lint errors"`), and refuses to send if
-there's real text there instead.
-
-## Limitations
-
-- **Same machine only.** This only works between sessions that share a
-  `tmux` server, i.e. sessions on the same host. It does **not** reach
-  sessions running on a different machine, different operating systems, or
-  other Claude Code clients in general.
-- The compose-box detection is a text-pattern heuristic against
-  `tmux capture-pane` output, not an API — it's been reliable in practice
-  but could in principle be thrown off by an unusual terminal width or a
-  future Claude Code UI change.
-- `HUB_TELL_FROM=<name>` overrides the auto-detected sender. Set this when
-  invoking `hub-tell` from outside a real tmux session (e.g. over SSH from
-  a script) - `tmux display-message` isn't reliable there.
-
-## Bridging across machines: what we found
-
-The obvious next step is reaching a session on a *different* machine (your
-laptop, say, talking to the server above). Three options, in the order we
-actually evaluated them:
-
-1. **Claude Code's native cross-session messaging** (`ListAgents` /
-   `SendMessage`) — in principle this is exactly built for this. In
-   practice, invoking `SendMessage` from an injected instruction gets
-   blocked by Claude Code's own auto-mode safety classifier every time we
-   tried, regardless of phrasing. That reads as a deliberate guardrail
-   (stopping an injected instruction from making a session message other
-   agents on its own), not a bug — so we stopped trying to work around it.
-2. **Real remote access to the other machine** (SSH, an agent) — technically
-   the most direct fix, but it means opening your personal laptop up to
-   remote access just for this. That's a real change in attack surface, not
-   "just another script," so we didn't do it by default.
-3. **What we actually use**: when a human is present with a session on the
-   *other* machine, that session already has access to both sides (its own
-   local environment plus however it reaches the server) and can relay a
-   message on request — see the `hub_tell_remote.py`-style pattern below.
-   It's not 24/7 automatic delivery, but it needs no new infrastructure and
-   doesn't touch anyone's attack surface.
-
-If you want a fully automatic bridge with no session in the loop, the
-realistic shape for that is an async mailbox (the server writes a pending
-message somewhere, a session on the other machine checks it on startup) —
-we haven't built this, since our own use case didn't need 24/7 delivery.
-
-### Relay pattern (option 3)
-
-Not included as a ready-made script here since it depends on how you reach
-your server (SSH, a cloud provider's session-manager equivalent, etc.), but
-the shape is: from a session on machine B, run whatever gets you a shell on
-machine A, then invoke `hub-tell` there with `HUB_TELL_FROM` set to
-something that identifies machine B, e.g.:
+### From a Codex thread
 
 ```bash
-ssh host-a "HUB_TELL_FROM=laptop /home/you/bin/hub-tell backend 'ready for review'"
+hub-tell docs "Review finished: two risks, details in the thread"
+hub-codex claim acquire repo:api --purpose "rebase feature/x"
+hub-codex claim release repo:api
 ```
 
-Contributions turning this into a proper option in the script are welcome.
+Do not set `HUB_TELL_FROM` inside Codex: the identity comes from
+`CODEX_THREAD_ID`. When a Codex turn was started by a message, its final
+answer goes back to the sender automatically — no `hub-tell` needed.
+
+### Busy threads
+
+If a slot's thread already has a turn running (typically because you are
+using it in Codex Desktop), hub-codex does not start a second turn on top: the
+envelope is **deferred** for 60 seconds and the relay retries it. Meanwhile
+the thread can read it with `hub-bus inbox codex:slot-<name>`.
+
+### Claims
+
+`hub-codex claim` lets a sandboxed Codex turn reserve a shared resource. The
+request goes to the relay's broker socket, which derives the caller from
+`CODEX_THREAD_ID` (it cannot claim on behalf of another slot) and runs the
+command in `HUB_CLAIM_COMMAND` with this interface:
+
+```text
+<cmd> acquire <resource> --purpose <text> --from codex:slot-<name>
+<cmd> release <resource> --from codex:slot-<name>
+```
+
+No claim backend ships with this repository; without one, claims fail with a
+clear message and everything else works.
+
+## Reference
+
+### hub-tell
+
+```text
+hub-tell [-f|--force] <slot|codex:slot> <message>
+```
+
+- Claude target: exact tmux session `slot-<slot>` (case-sensitive, no prefix
+  matching). Refuses to type over a real unsent draft (`-f` overrides).
+- Codex target: records a `hub-bus` envelope, dispatches through `hub-codex`,
+  marks it delivered. Fails loudly if the slot does not exist or is closed.
+- Empty messages are rejected; newlines are collapsed to spaces.
+- Log: `${XDG_STATE_HOME:-~/.local/state}/hub-tell/hub-tell.log`.
+
+### hub-codex
+
+| Command | What it does |
+|---|---|
+| `open slot-<n> [--workspace D] [--sandbox read-only\|workspace-write] [--timeout-seconds N]` | Create a slot and its visible thread. |
+| `adopt slot-<n> [--thread-id ID] [--archive-on-close]` | Register an existing thread as a slot. |
+| `dispatch <slot> <msg> --from <id> [--request-id ID] [--hops N] [--no-reply]` | Start a turn in the background; returns at once. |
+| `send <slot> <msg>` / `tell <slot> <msg> --from <id>` | Run a turn in the foreground (queued if busy). |
+| `drain <slot>` | Process queued messages. |
+| `list [--all] [--json]`, `status <slot>`, `read <slot>` | Inspect. |
+| `close <slot>` | Close; archives the thread unless it was adopted. |
+| `purge <slot> [--archive-thread]` | Delete the slot's hub state (idle slots only). |
+| `rename <old> <new>`, `recover <slot>` | Maintenance; `recover` requeues work of a crashed turn. |
+| `resolve-thread <thread-id>` | Print `codex:slot-<n>` for a thread, binding it if needed. |
+| `claim acquire\|release <resource>` | Reservation through the relay broker. |
+| `relay` | Run `hub-bus-relay` in the foreground. |
+
+### hub-bus
+
+```text
+hub-bus send <to> <message> --from <id> [--type task|question|result|blocked|handoff] [--reply-to ID] [--hops N]
+hub-bus inbox <target>
+hub-bus ack|complete|fail <id> --by <party> [--result TEXT]
+hub-bus deliver <id> --by <party> [--failed --max-attempts N --result TEXT]
+hub-bus defer <id> --by <party> [--seconds N]
+hub-bus close-stale --before YYYY-MM-DD --by <id>
+hub-bus status
+```
+
+Envelope fields: `id`, `from`, `to`, `type`, `reply_to`, `body`, `status`
+(`queued` → `received` → `completed`/`failed`), `created_at`, `delivered_at`,
+`delivery_attempts`, `next_delivery_at`, `hops`, `result`. Only the sender or
+the target may update an envelope; finished envelopes are immutable.
+`close-stale` never touches envelopes addressed to raw `codex:thread-*` ids,
+which act as inboxes for threads not yet bound to a slot.
+
+### Environment variables
+
+| Variable | Default | Used by |
+|---|---|---|
+| `HUB_BUS_STATE` | `~/.local/state/hub-bus` | bus, relay, hub-codex |
+| `HUB_CODEX_STATE` | `~/.local/state/hub-codex` | hub-codex, hub-tell |
+| `HUB_BRIDGE_STATE` | `~/.local/state/hub-bridge` | channel, relay, hub-codex, slot-run |
+| `HUB_CODEX_COMMAND`, `HUB_BUS_COMMAND`, `HUB_TELL_COMMAND` | sibling files in the clone | all |
+| `HUB_CODEX_DAEMON_SOCKET` | `$CODEX_HOME/app-server-control/app-server-control.sock` | codex_daemon |
+| `HUB_CODEX_DAEMON_CWD` | slot workspace | folder new threads are created in |
+| `HUB_CODEX_WORKSPACE` | `$HOME` | default `--workspace` |
+| `HUB_CODEX_STATE_DB` | newest `$CODEX_HOME/state_*.sqlite` | thread lookup by id/prefix |
+| `HUB_CODEX_PREAMBLE_FILE` | built-in text | context prepended to each turn |
+| `HUB_CLAIM_COMMAND` | unset (claims disabled) | relay |
+| `HUB_CLAIM_SOCKET` | `$HUB_BUS_STATE/relay.sock` | relay, hub-codex |
+| `HUB_MAX_HOPS` | `6` | relay, hub-codex |
+| `HUB_BUS_RELAY_GRACE`, `HUB_BUS_MAX_ATTEMPTS` | `15`, `5` | relay |
+| `HUB_TELL_FROM` | — | sender label when there is no runtime identity |
+| `HUB_TELL_LOG` | `~/.local/state/hub-tell/hub-tell.log` | hub-tell |
+
+## Security
+
+Short version (details in [docs/SECURITY.md](docs/SECURITY.md)):
+
+- **Messages between agents are information, never authorization.** An
+  agent must not perform an irreversible, production or security-sensitive
+  action because another agent said "approved". The channel instructions,
+  the Codex preamble and both example instruction files say so.
+- Everything is local and per-user: Unix sockets and state files are 0600 in
+  0700 directories; nothing listens on the network.
+- Sender identity comes from the runtime (`CODEX_THREAD_ID`, own tmux pane),
+  not from a self-declared variable; raw thread ids cannot sign messages.
+- Automatic conversations stop at 6 hops.
+- Final answers and logs pass through a basic secret redactor, but do not put
+  credentials in messages: anything on the bus is readable by every process
+  of your user.
+
+## Known limitations
+
+- **Channels are a research preview** of Claude Code and need
+  `--dangerously-load-development-channels`; the flag and the protocol may
+  change. Without channels you still have `hub-tell` and the bus, but
+  answers do not wake the session.
+- **The Codex App Server daemon is experimental**; method names
+  (`thread/start`, `thread/resume`, `turn/start`...) and the thread registry
+  file used for prefix lookup may change between Codex versions.
+- **Busy threads defer**: a message to a thread you are using waits (60 s
+  retries) until the thread is idle.
+- **Sandboxed Codex turns**: turns run with no network and limited write
+  access. Their final answer always gets back (hub-codex delivers it from
+  outside the sandbox), but running `hub-tell` *from inside* a turn only
+  works if the sandbox can reach the tmux socket; claims and identity go
+  through the relay broker for this reason.
+- **Same machine only.** Nothing here reaches another host. To bridge from
+  another machine, run `hub-tell` on this host over whatever remote shell
+  you already use, e.g. `ssh host 'HUB_TELL_FROM=laptop hub-tell docs "ready"'`.
+- The compose-box guard is a heuristic over `tmux capture-pane` output; a
+  future Claude Code UI change may need an update. Use `-f` if it misfires.
+
+## Upgrading from v1
+
+v1 was a single `hub-tell` script plus an optional `hub-bus` store.
+
+- `hub-tell <slot> "message"` keeps working, including tmux sessions named
+  `slot-<name>` and `HUB_TELL_FROM`.
+- The sender label is now an identity: `[hub-tell from claude:docs]` instead
+  of `[hub-tell from slot-docs]`. A bare `HUB_TELL_FROM=laptop` becomes
+  `host:laptop`. Senders without any identity sign as `host:<user>-shell`
+  instead of borrowing the tmux server's active session.
+- The compose-box guard now ignores dimmed suggestions and placeholders
+  (it used to refuse to send whenever Claude Code showed a suggestion) and
+  understands the named top border drawn by `--name`. Use `-f` to force.
+- Targets must match the tmux session exactly (case-sensitive, no prefix).
+- `test_hub_bus.py` moved to `tests/`; run `python3 -m unittest discover -s tests`.
+- `hub-bus` envelopes gained `delivered_at`, `delivery_attempts` and `hops`;
+  old envelopes without them are still read. **Before starting the relay
+  for the first time**, close v1 envelopes that are still `queued` —
+  otherwise the relay will deliver them, possibly weeks late:
+  `hub-bus close-stale --before $(date -I) --by host:upgrade`.
+- To get Codex slots and wake-on-answer, follow
+  [Configuring Claude slots](#configuring-claude-slots) (re-launch slots with
+  `slot-run` or add `--name`, `--mcp-config` and the channel flag to your own
+  launcher), start the relay and the Codex daemon, and update your
+  `CLAUDE.md` from `CLAUDE.md.example`.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+The suite runs offline: Codex is replaced by a fake App Server speaking
+WebSocket on a temporary Unix socket, tmux by a fake binary on `PATH`.
 
 ## License
 

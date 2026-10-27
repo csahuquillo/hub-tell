@@ -1,70 +1,236 @@
 #!/bin/bash
-# hub-tell <slot> <message...>
-# Writes a message as a user turn into another Claude Code session's tmux
-# pane on the same machine (no network involved, everything is local).
+# hub-tell [-f|--force] <slot|codex:slot> <message...>
+#
+# Claude target (<slot>): types the message as a user turn into the tmux
+# session "slot-<slot>" on this machine. No network involved.
+# Codex target (codex:<slot>): records a correlated hub-bus envelope and
+# dispatches a background turn to that Codex slot via hub-codex.
+#
+# The receiver sees "[hub-tell from <sender>] <message>".
 set -euo pipefail
 
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+FORCE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -f|--force) FORCE=1; shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
 if [ $# -lt 2 ]; then
-  echo "Usage: hub-tell <slot> <message>" >&2
+  echo "Usage: hub-tell [-f|--force] <slot|codex:slot> <message>" >&2
   exit 1
 fi
 
 TARGET="$1"; shift
+# A newline inside the message would press Enter half-way through typing it,
+# so collapse everything to a single line first.
+MSG="$(printf '%s' "$*" | tr '\n' ' ')"
+LOG="${HUB_TELL_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/hub-tell/hub-tell.log}"
+HUB_CODEX="${HUB_CODEX_COMMAND:-$SCRIPT_DIR/hub-codex}"
+HUB_BUS="${HUB_BUS_COMMAND:-$SCRIPT_DIR/hub-bus}"
+NAME_PATTERN='[A-Za-z0-9][A-Za-z0-9._-]{0,63}'
+
+# `hub-tell docs "$MSG"` with MSG unset used to look like a successful delivery
+# of an empty turn. Refuse it before touching any slot.
+if [[ -z "${MSG//[[:space:]]/}" ]]; then
+  echo "ERROR: empty message; nothing delivered. Pass the text literally or define the variable in the same command." >&2
+  exit 2
+fi
+
+log_line() {
+  { mkdir -p "$(dirname "$LOG")" && printf '%s %s\n' "$(date -Iseconds)" "$*" >> "$LOG"; } 2>/dev/null \
+    || echo "WARNING: delivered, but the log could not be written." >&2
+}
+
+# Work out who is sending. A runtime identity, when available, is
+# authoritative: HUB_TELL_FROM may have been inherited from another slot.
+resolve_from() {
+  local inherited="${HUB_TELL_FROM:-}"
+  local expected=""
+  local tmux_session=""
+
+  # 1. Inside a Codex thread: bind CODEX_THREAD_ID to its codex:slot-<name>.
+  if [ -n "${CODEX_THREAD_ID:-}" ]; then
+    if [ ! -x "$HUB_CODEX" ]; then
+      echo "ERROR: hub-codex not found; cannot resolve the identity of CODEX_THREAD_ID." >&2
+      return 1
+    fi
+    expected="$("$HUB_CODEX" resolve-thread "$CODEX_THREAD_ID" 2>/dev/null)" || {
+      echo "ERROR: CODEX_THREAD_ID could not be bound to a Codex slot; message not sent." >&2
+      return 1
+    }
+    if [[ ! "$expected" =~ ^codex:slot-${NAME_PATTERN}$ ]]; then
+      echo "ERROR: hub-codex returned an invalid slot identity; message not sent." >&2
+      return 1
+    fi
+  fi
+
+  # 2. Inside a tmux client: our OWN pane's session. Only trust tmux when $TMUX
+  # is set; outside a client, `tmux display-message` reports the server's
+  # active session, i.e. another slot's identity.
+  if [ -z "$expected" ] && [ -n "${TMUX:-}" ]; then
+    tmux_session="$(tmux display-message -p -t "${TMUX_PANE:-}" '#S' 2>/dev/null || true)"
+    if [ -n "$tmux_session" ]; then
+      if [[ "$tmux_session" == slot-* ]]; then
+        expected="claude:${tmux_session#slot-}"
+      else
+        expected="host:${tmux_session}"
+      fi
+    fi
+  fi
+
+  if [ -n "$expected" ]; then
+    if [ -n "$inherited" ] && [ "$inherited" != "$expected" ]; then
+      echo "hub-tell: ignoring inherited HUB_TELL_FROM '$inherited'; current sender is '$expected'." >&2
+    fi
+    printf '%s\n' "$expected"
+    return 0
+  fi
+
+  # 3. Explicit HUB_TELL_FROM. A codex:slot-X value is only accepted if that
+  # slot exists (a stale name must not sign messages), and raw thread ids
+  # are never accepted as a sender.
+  if [[ "$inherited" == codex:* ]] && [ ! -d "${HUB_CODEX_STATE:-$HOME/.local/state/hub-codex}/slots/${inherited#codex:}" ]; then
+    echo "hub-tell: ignoring HUB_TELL_FROM '$inherited': that Codex slot does not exist." >&2
+    inherited=""
+  fi
+  if [[ "$inherited" =~ ^(claude|codex|host):${NAME_PATTERN}$ && ! "$inherited" =~ ^codex:thread- ]]; then
+    printf '%s\n' "$inherited"
+    return 0
+  fi
+  # v1 compatibility: a bare label such as HUB_TELL_FROM=laptop.
+  if [[ "$inherited" =~ ^${NAME_PATTERN}$ ]]; then
+    printf 'host:%s\n' "$inherited"
+    return 0
+  fi
+
+  # 4. No verifiable identity: sign honestly as a host shell instead of
+  # borrowing another slot's name.
+  printf 'host:%s-shell\n' "$(id -un 2>/dev/null || echo user)"
+}
+
+# --- Codex target ---------------------------------------------------------------
+if [[ "$TARGET" == codex:* ]]; then
+  if [ "$FORCE" -eq 1 ]; then
+    echo "ERROR: --force only applies to Claude slots (they have a compose box)" >&2
+    exit 1
+  fi
+  CODEX_TARGET="${TARGET#codex:}"
+  if [[ ! "$CODEX_TARGET" =~ ^${NAME_PATTERN}$ ]]; then
+    echo "ERROR: invalid Codex target: $TARGET" >&2
+    exit 1
+  fi
+  FROM="$(resolve_from)"
+  # The durable identity of a Codex slot is always codex:slot-<name>, even
+  # when the caller uses the short form codex:<name>.
+  BUS_TARGET="codex:${CODEX_TARGET}"
+  [[ "$CODEX_TARGET" == slot-* ]] || BUS_TARGET="codex:slot-${CODEX_TARGET}"
+
+  # Register a correlated envelope before dispatching: the Codex slot ACKs and
+  # completes/fails this same id, so nobody has to infer completion from chat.
+  REQUEST_ID=""
+  if [ -x "$HUB_BUS" ]; then
+    REQUEST_ID="$("$HUB_BUS" send "$BUS_TARGET" "$MSG" --from "$FROM" --type task)" || {
+      echo "ERROR: could not register the correlated envelope for $BUS_TARGET; not dispatching." >&2
+      exit 1
+    }
+  fi
+  DISPATCH_ARGS=(dispatch "$CODEX_TARGET" "$MSG" --from "$FROM")
+  [ -z "$REQUEST_ID" ] || DISPATCH_ARGS+=(--request-id "$REQUEST_ID")
+
+  # dispatch validates the slot synchronously and exits non-zero if it does
+  # not exist or is closed, so a typo never looks delivered.
+  if "$HUB_CODEX" "${DISPATCH_ARGS[@]}"; then
+    # Mark it delivered now so hub-bus-relay does not dispatch it a second time.
+    [ -z "$REQUEST_ID" ] || "$HUB_BUS" deliver "$REQUEST_ID" --by "$FROM" >/dev/null 2>&1 || true
+    log_line "FROM=$FROM TO=$TARGET REQUEST_ID=$REQUEST_ID MSG=$MSG"
+    if [ -n "$REQUEST_ID" ]; then
+      echo "Dispatched to $BUS_TARGET as $REQUEST_ID."
+    else
+      echo "Dispatched to $BUS_TARGET."
+    fi
+    exit 0
+  else
+    rc=$?
+    [ -z "$REQUEST_ID" ] || "$HUB_BUS" fail "$REQUEST_ID" --by "$FROM" --result "Could not dispatch the Codex turn." >/dev/null 2>&1 || true
+    echo "ERROR: hub-tell could not dispatch to $TARGET (hub-codex exited $rc). Message NOT delivered." >&2
+    exit "$rc"
+  fi
+fi
+
+# --- Claude target (tmux) -------------------------------------------------------
 SESSION="slot-${TARGET}"
-MSG="$*"
-LOG="${XDG_STATE_HOME:-$HOME/.local/state}/hub-tell/hub-tell.log"
+# tmux resolves a bare target as a prefix: `slot-api` could silently
+# select `slot-api2`. A leading `=` demands the exact session name.
+TMUX_SESSION="=${SESSION}"
+# Pane commands need a trailing colon after an exact session target. Do not
+# reuse TMUX_PANE here: resolve_from() needs it to identify the caller.
+TARGET_PANE="${TMUX_SESSION}:"
 
-if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "ERROR: session '$SESSION' does not exist (is slot '$TARGET' open?)" >&2
+if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  echo "ERROR: there is no session named exactly '$SESSION' (is slot '$TARGET' open? names are case-sensitive)." >&2
   exit 1
 fi
 
-# Claude Code's compose box is whatever sits between the last two
-# horizontal-rule (────) lines of the pane. If it already has text (an
-# unsent draft - common if you type from a phone/Remote Control client and
-# never hit enter), we must NOT write on top of it: it would get
-# concatenated with the new message and Enter would submit both as
-# nonsense. Abort instead of risking that - this happens more often than
-# you'd think, see README.
-PANE="$(tmux capture-pane -t "$SESSION" -p)"
-BOX="$(printf '%s\n' "$PANE" | awk '
-  /^─+$/ { seps[++n] = NR }
-  { lines[NR] = $0 }
-  END {
-    if (n < 2) { print "NO_BOX_FOUND"; exit }
-    start = seps[n-1]; end = seps[n]
-    out = ""
-    for (i = start+1; i < end; i++) out = out lines[i] "\n"
-    printf "%s", out
-  }
-')"
+# --- Real draft vs. ghost suggestion ----------------------------------------------
+# Claude Code's compose box is what sits between the last two horizontal-rule
+# lines of the pane. If a human left an unsent draft there we must NOT type on
+# top of it (both would be submitted as one message).
+#
+# But Claude Code also fills an empty box with dimmed text: placeholder hints
+# (`Try "..."`), continuation suggestions, "Press up to edit queued messages".
+# Those are not drafts. They are rendered with SGR 2 (dim) while typed text is
+# normal intensity, so we capture with escapes (-e), drop the dim runs, and
+# whatever remains is a real draft.
+#
+# When the session runs with --name, the top border carries the name
+# ("──── slot-x ─"), so a rule may contain one word in the middle.
+if [ "$FORCE" -eq 0 ]; then
+  ESC=$'\033'
+  BOX_ANSI="$(tmux capture-pane -t "$TARGET_PANE" -e -p | awk -v esc="$ESC" '
+    { raw[NR]=$0; t=$0; gsub(esc "\\[[0-9;]*m","",t); if (t ~ /^─+( [^ ]+ ─+)?$/) seps[++n]=NR }
+    END {
+      if (n < 2) { print "NO_BOX_FOUND"; exit }
+      for (i = seps[n-1]+1; i < seps[n]; i++) printf "%s\n", raw[i]
+    }
+  ')"
 
-if [ "$BOX" = "NO_BOX_FOUND" ]; then
-  echo "ERROR: could not locate the compose box for '$SESSION', aborting to be safe" >&2
-  exit 1
+  if [ "$BOX_ANSI" = "NO_BOX_FOUND" ]; then
+    echo "ERROR: could not locate the compose box of '$SESSION' (a menu or dialog open?); aborting. Use -f to force." >&2
+    exit 1
+  fi
+
+  # A dim run starts at ESC[2m and only ends at ESC[0m or ESC[22m; colour
+  # changes in between (e.g. ESC[39m) do not end it, so match up to the real
+  # reset. Then strip the remaining escapes, the prompt glyph (U+276F), NBSP
+  # (U+00A0) and whitespace.
+  REMAIN="$(printf '%s' "$BOX_ANSI" \
+    | perl -0777 -pe 's/\e\[2m.*?\e\[(?:0|22)m//gs; s/\e\[2m.*\z//s; s/\e\[[0-9;]*m//g;' \
+    | LC_ALL=C sed -e 's/\xe2\x9d\xaf//g' -e 's/\xc2\xa0//g' \
+    | tr -d '[:space:]')"
+
+  # Belt and braces: if a known placeholder survives (e.g. a truncated
+  # capture without its reset), it is still not a draft. Extend this list if
+  # new dimmed placeholders show up.
+  REMAIN_LOW="$(printf '%s' "$REMAIN" | tr 'A-Z' 'a-z')"
+  if [ -n "$REMAIN" ] && ! printf '%s' "$REMAIN_LOW" | grep -qE '^(try".*"|pressuptoeditqueuedmessages)$'; then
+    echo "ERROR: '$SESSION' has a REAL unsent draft in its compose box:" >&2
+    echo "       \"$REMAIN\"" >&2
+    echo "       Not typing over it. If this is a false positive, resend with: hub-tell -f $TARGET \"...\"" >&2
+    exit 1
+  fi
 fi
 
-# The first line may be the placeholder hint Claude Code shows when the
-# box is empty (e.g. Try "fix lint errors"), not real user text - that
-# doesn't count as "busy". We don't match the prompt glyph itself (avoids
-# locale/encoding headaches when this runs over SSH/SSM): matching the
-# ASCII hint pattern is enough and far more portable.
-FIRST_LINE="$(printf '%s\n' "$BOX" | head -n1)"
-REST_LINES="$(printf '%s\n' "$BOX" | tail -n +2 | tr -d '[:space:]')"
+FROM="$(resolve_from)"
 
-if printf '%s' "$FIRST_LINE" | grep -qE 'Try ".*"[[:space:]]*$' && [ -z "$REST_LINES" ]; then
-  : # box is genuinely empty (just the placeholder) -> proceed
-else
-  echo "ERROR: '$SESSION' already has unsent text in its compose box, aborting" >&2
-  exit 1
-fi
-
-FROM="${HUB_TELL_FROM:-$(tmux display-message -p '#S' 2>/dev/null || echo unknown)}"
-
-tmux send-keys -t "$SESSION" -l "[hub-tell from ${FROM}] ${MSG}"
+# Typing and Enter must be two separate send-keys calls: in one call the Enter
+# can get lost while the target is mid-render, leaving an unsent draft.
+tmux send-keys -t "$TARGET_PANE" -l "[hub-tell from ${FROM}] ${MSG}"
 sleep 1
-tmux send-keys -t "$SESSION" Enter
+tmux send-keys -t "$TARGET_PANE" Enter
 
-mkdir -p "$(dirname "$LOG")"
-printf '%s FROM=%s TO=%s MSG=%s\n' "$(date -Iseconds)" "$FROM" "$SESSION" "$MSG" >> "$LOG"
+log_line "FROM=$FROM TO=$SESSION FORCE=$FORCE MSG=$MSG"
 echo "Sent to ${SESSION}."

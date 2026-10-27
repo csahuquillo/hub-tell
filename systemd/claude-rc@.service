@@ -1,0 +1,21 @@
+# Example user unit: one Claude Code slot per instance.
+#   systemctl --user enable --now claude-rc@docs
+# Requires lingering so slots survive logout:  loginctl enable-linger "$USER"
+# Adjust the paths if you did not link the scripts into ~/.local/bin.
+[Unit]
+Description=Claude Code slot %i (tmux session slot-%i)
+After=default.target
+
+[Service]
+Type=simple
+# Optional per-slot settings (HUB_SLOT_CWD, HUB_RC_PREFIX, ...).
+EnvironmentFile=-%h/.config/hub-tell/slot-%i.env
+ExecStart=%h/.local/bin/slot-run %i
+ExecStopPost=-/usr/bin/env tmux kill-session -t =slot-%i
+Restart=always
+RestartSec=5
+# See 20-killmode.conf: the shared tmux server lives in the first slot's cgroup.
+KillMode=process
+
+[Install]
+WantedBy=default.target

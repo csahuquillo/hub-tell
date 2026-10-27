@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Thin launcher: resolves symlinks so it can be linked into ~/bin or ~/.local/bin.
+set -euo pipefail
+exec python3 "$(dirname "$(readlink -f "$0")")/hub-codex.py" "$@"
