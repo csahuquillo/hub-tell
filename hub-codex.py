@@ -263,6 +263,170 @@ def daemon_thread_busy(thread_id: str) -> bool:
         return False
 
 
+def steer_turn(name: str, state: dict[str, Any], prompt: str, sender: str | None,
+               request_id: str | None) -> bool:
+    """Inject a message into the slot's active daemon turn when steering is enabled."""
+    try:
+        client = daemon_module().CodexDaemon(timeout=30)
+        client.initialize()
+        if sender and sender.startswith("claude:"):
+            reply_hint = f"If a reply is needed, use hub-tell {sender.split(':', 1)[1]}."
+        elif sender and sender.startswith("codex:"):
+            reply_hint = f"If a reply is needed, use hub-tell {sender}."
+        else:
+            reply_hint = "This is information; no reply is needed unless useful."
+        message = (f"[hub · from {sender or 'hub'} · to codex:{name} · message during your turn]\n"
+                   f"{prompt}\n\n({reply_hint})")
+        turn_id = client.inject_turn(state["thread_id"], redact(message))
+    except Exception:  # daemon errors mean the caller should queue or defer instead
+        return False
+    finally:
+        if "client" in locals():
+            try:
+                client.close()
+            except Exception:
+                pass
+    if not turn_id:
+        return False
+    record_state_change(name, state, "turn.steered", actor="hub-codex",
+                        details={"request_id": request_id, "turn_id": turn_id, "sender": sender})
+    update_bus(request_id, "complete", name, f"Injected into active turn {turn_id}")
+    return True
+
+
+def _turn_text(turn: dict[str, Any]) -> str:
+    return "\n".join(item.get("text", "") for item in turn.get("items", []) or []
+                     if item.get("type") == "agentMessage" and isinstance(item.get("text"), str)).strip()
+
+
+def _find_daemon_turn(client: Any, thread_id: str, turn_id: str, items_view: str) -> dict[str, Any] | None:
+    cursor = None
+    seen_cursors: set[str] = set()
+    while True:
+        page = client.list_turns(thread_id, items_view=items_view, limit=10, cursor=cursor)
+        match = next((turn for turn in page.get("data", []) or [] if turn.get("id") == turn_id), None)
+        if match:
+            return match
+        next_cursor = page.get("nextCursor")
+        if not next_cursor or next_cursor in seen_cursors:
+            return None
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+
+def watch_timed_out_turn(name: str, thread_id: str, turn_id: str | None, sender: str | None,
+                         request_id: str | None, hops: int, timeout_seconds: int = 10800,
+                         poll_seconds: float = 10) -> bool:
+    """Wait for the original daemon turn and deliver its result at most once."""
+    if not turn_id:
+        return False
+    marker = slot_dir(name) / f".delivered-turn-{re.sub(r'[^A-Za-z0-9_.-]', '_', turn_id)}"
+    if marker.exists():
+        return True
+    module = daemon_module()
+    deadline = time.monotonic() + timeout_seconds
+    client = None
+    try:
+        while time.monotonic() < deadline:
+            if client is None:
+                try:
+                    client = module.CodexDaemon(timeout=30)
+                    client.initialize()
+                except Exception:
+                    if client is not None:
+                        client.close()
+                    client = None
+                    time.sleep(poll_seconds)
+                    continue
+            try:
+                selected = _find_daemon_turn(client, thread_id, turn_id, "notLoaded")
+            except Exception:
+                client.close()
+                client = None
+                time.sleep(poll_seconds)
+                continue
+            if selected and selected.get("status") in {"completed", "failed", "interrupted"}:
+                if marker.exists():
+                    return True
+                try:
+                    final_turn = _find_daemon_turn(client, thread_id, turn_id, "full")
+                except Exception:
+                    client.close()
+                    client = None
+                    time.sleep(poll_seconds)
+                    continue
+                text = redact(_turn_text(final_turn or {}))
+                if not text:
+                    text = "RESULT: BLOCKED\nThe turn ended without a recoverable final message."
+                elif selected.get("status") != "completed" and terminal_outcome(text) != "blocked":
+                    text = f"RESULT: BLOCKED\nThe Codex turn ended with status {selected.get('status')}.\n\n{text}"
+                try:
+                    fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                except FileExistsError:
+                    return True
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(now() + "\n")
+                outcome = terminal_outcome(text)
+                lock = open_lock(name)
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    current = load_state(name)
+                    active = current.get("active_turn", {})
+                    if active.get("timeout_waiting") and active.get("daemon_turn_id") == turn_id:
+                        sequence = active.get("sequence")
+                        message_path = None
+                        if isinstance(sequence, int):
+                            message_path = slot_dir(name) / "messages" / f"{sequence:04d}.md"
+                            message_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                            message_path.write_text(text + "\n", encoding="utf-8")
+                        current.pop("active_turn", None)
+                        current.update(status="idle", last_exit_code=0 if outcome == "completed" else 1,
+                                       turn_count=sequence or current.get("turn_count", 0),
+                                       last_message=str(message_path) if message_path else None,
+                                       last_terminal_result={"sequence": sequence, "outcome": outcome,
+                                                             "completed_at": now(), "request_id": request_id,
+                                                             "message": str(message_path) if message_path else None})
+                        record_state_change(name, current, "turn.timeout-finished", actor="hub-codex",
+                                            details={"request_id": request_id, "turn_id": turn_id})
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    lock.close()
+                update_bus(request_id, "complete" if outcome == "completed" else "fail", name, text)
+                deliver_reply(sender, name, text, request_id=request_id, outcome=outcome, hops=hops)
+                return True
+            time.sleep(poll_seconds)
+        expiry = "The wait for Codex's final reply exceeded 3 hours; no recoverable result was found."
+        lock = open_lock(name)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            current = load_state(name)
+            active = current.get("active_turn", {})
+            if active.get("timeout_waiting") and active.get("daemon_turn_id") == turn_id:
+                current.pop("active_turn", None)
+                current.update(status="failed", last_exit_code=1,
+                               last_terminal_result={"sequence": active.get("sequence"), "outcome": "failed",
+                                                     "completed_at": now(), "request_id": request_id})
+                record_state_change(name, current, "turn.timeout-expired", actor="hub-codex",
+                                    details={"request_id": request_id, "turn_id": turn_id})
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        update_bus(request_id, "fail", name, expiry)
+        deliver_reply(sender, name, expiry, request_id=request_id, outcome="failed", hops=hops)
+        return False
+    finally:
+        if client is not None:
+            client.close()
+
+
+def start_turn_watcher(name: str, thread_id: str, turn_id: str, sender: str | None,
+                       request_id: str | None, hops: int) -> None:
+    command = [sys.executable, str(Path(__file__).resolve()), "watch-turn", name, thread_id,
+               turn_id, sender or "-", request_id or "-", str(hops)]
+    subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+
+
 def archive_thread(state: dict[str, Any]) -> None:
     thread_id = state.get("thread_id")
     if not thread_id:
@@ -352,6 +516,9 @@ def run_turn(name: str, state: dict[str, Any], prompt: str, sender: str | None,
             deliver_reply(sender, name, notice, request_id=request_id, hops=hops)
         return 1
     if state.get("thread_id") and daemon_thread_busy(state["thread_id"]):
+        if state.get("busy_policy", "steer") == "steer" and steer_turn(
+                name, state, prompt, sender, request_id):
+            return 0
         return defer_turn(name, state, request_id)
 
     module = daemon_module()
@@ -379,10 +546,28 @@ def run_turn(name: str, state: dict[str, Any], prompt: str, sender: str | None,
         try:
             text = redact(client.run_turn(thread_id, render_prompt(name, sender, prompt), timeout))
         except module.ThreadBusy:
-            # Lost the race against a human starting a turn after our check.
+            # A turn began after the initial busy check; steer it or defer safely.
             state["status"] = "idle"
             state.pop("active_turn", None)
+            if state.get("busy_policy", "steer") == "steer" and steer_turn(
+                    name, state, prompt, sender, request_id):
+                return 0
             return defer_turn(name, state, request_id)
+        except getattr(module, "TurnTimeout", ()) as exc:
+            turn_id = exc.turn_id
+            state.update(status="working", thread_id=thread_id, last_exit_code=0)
+            state["active_turn"].update(timeout_waiting=True, daemon_turn_id=turn_id)
+            event = "turn.timeout-waiting" if turn_id else "turn.timeout-untracked"
+            record_state_change(name, state, event, actor="hub-codex",
+                                details={"sequence": sequence, "request_id": request_id, "turn_id": turn_id})
+            notice = "The Codex turn is still working; its reply will arrive when it finishes."
+            if reply_to_sender:
+                deliver_reply(sender, name, notice, request_id=request_id, outcome="working", hops=hops)
+            if turn_id:
+                start_turn_watcher(name, thread_id, turn_id, sender if reply_to_sender else None,
+                                   request_id, hops)
+            print(notice)
+            return 0
         if text:
             final_path.write_text(text + "\n", encoding="utf-8")
             os.chmod(final_path, 0o600)
@@ -473,21 +658,50 @@ def drain(name: str, state: dict[str, Any]) -> int:
                          {"at": now(), "error": "claimed queue could not be parsed", "preserved_as": str(corrupt)})
             continue
         try:
-            for index, item in enumerate(items):
+            batches: list[list[dict[str, Any]]] = []
+            by_sender: dict[str | None, list[dict[str, Any]]] = {}
+            for item in items:
+                sender_key = item.get("sender")
+                if sender_key not in by_sender:
+                    by_sender[sender_key] = []
+                    batches.append(by_sender[sender_key])
+                by_sender[sender_key].append(item)
+            for index, batch in enumerate(batches):
+                prompts = []
+                for item in batch:
+                    prompt = item["prompt"]
+                    try:
+                        queued_at = dt.datetime.fromisoformat(item.get("at", "").replace("Z", "+00:00"))
+                        age_seconds = max(0, (dt.datetime.now(queued_at.tzinfo) - queued_at).total_seconds())
+                    except (ValueError, TypeError):
+                        age_seconds = 0
+                    if age_seconds > 120:
+                        prompt = (f"[queued {max(2, int(age_seconds // 60))} min ago — may be outdated]\n"
+                                  f"{prompt}")
+                    prompts.append(prompt)
+                first = batch[0]
+                grouped_prompt = "\n\n---\n\n".join(prompts)
                 try:
-                    exit_code = run_turn(name, state, item["prompt"], item.get("sender"),
-                                         bool(item.get("reply_to_sender", True)), item.get("request_id"),
-                                         int(item.get("hops", 0)))
+                    exit_code = run_turn(
+                        name, state, grouped_prompt, first.get("sender"),
+                        any(bool(item.get("reply_to_sender", True)) for item in batch),
+                        first.get("request_id"), int(first.get("hops", 0)),
+                    )
                 except BaseException:
                     with queue_guard(name):
-                        for queued in items[index + 1:]:
-                            append_jsonl(queue, queued)
+                        for later in batches[index + 1:]:
+                            for queued in later:
+                                append_jsonl(queue, queued)
                     raise
+                for item in batch[1:]:
+                    update_bus(item.get("request_id"), "complete", name,
+                               f"Grouped with {first.get('request_id') or 'another message'} from the same sender")
                 state = load_state(name)
                 if exit_code:
                     with queue_guard(name):
-                        for queued in items[index + 1:]:
-                            append_jsonl(queue, queued)
+                        for later in batches[index + 1:]:
+                            for queued in later:
+                                append_jsonl(queue, queued)
                     break
         finally:
             pending.unlink(missing_ok=True)
@@ -534,7 +748,7 @@ def command_open(args: argparse.Namespace) -> int:
         "name": args.name, "workspace": str(workspace), "sandbox": args.sandbox, "status": "idle",
         "thread_id": None, "turn_count": 0, "timeout_seconds": args.timeout_seconds,
         "created_at": now(), "updated_at": now(), "created_by": args.created_by,
-        "transport": "daemon", "archive_on_close": True,
+        "transport": "daemon", "busy_policy": getattr(args, "busy_policy", "steer"), "archive_on_close": True,
     }
     init_slot_dirs(args.name)
     save_state(args.name, state)
@@ -562,7 +776,7 @@ def command_adopt(args: argparse.Namespace) -> int:
         "thread_id": thread_id, "turn_count": 0, "timeout_seconds": args.timeout_seconds,
         "created_at": now(), "updated_at": now(), "created_by": args.created_by,
         "adopted": True, "adopted_at": now(), "archive_on_close": bool(args.archive_on_close),
-        "transport": "daemon",
+        "transport": "daemon", "busy_policy": getattr(args, "busy_policy", "steer"),
     }
     init_slot_dirs(args.name)
     save_state(args.name, state)
@@ -679,7 +893,7 @@ def command_resolve_thread_local(args: argparse.Namespace) -> int:
                 "thread_id": thread_id, "turn_count": 0, "timeout_seconds": args.timeout_seconds,
                 "created_at": now(), "updated_at": now(), "created_by": "resolve-thread",
                 "adopted": True, "adopted_at": now(), "archive_on_close": False,
-                "transport": "daemon", "auto_bound_from_thread": True,
+                "transport": "daemon", "busy_policy": "steer", "auto_bound_from_thread": True,
             }
             save_state(owner, state)
             record_state_change(owner, state, "thread.auto-bound", actor="resolve-thread",
@@ -728,6 +942,12 @@ def command_send(args: argparse.Namespace) -> int:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         lock.close()
+        busy_state = load_state(args.name)
+        if (busy_state.get("transport") == "daemon" and busy_state.get("busy_policy", "steer") == "steer"
+                and busy_state.get("thread_id") and daemon_thread_busy(busy_state["thread_id"])):
+            if steer_turn(args.name, busy_state, args.message, args.sender, args.request_id):
+                print(f"Message injected into the active turn of '{args.name}'.")
+                return 0
         queue_message(args.name, args.message, args.sender, not args.no_reply, args.request_id, args.hops)
         spawn_drain(args.name)
         print(f"Slot '{args.name}' is busy: message queued.")
@@ -969,6 +1189,7 @@ def build_parser() -> argparse.ArgumentParser:
     open_cmd.add_argument("--workspace", default=str(DEFAULT_WORKSPACE))
     open_cmd.add_argument("--sandbox", choices=("read-only", "workspace-write"), default="workspace-write")
     open_cmd.add_argument("--timeout-seconds", type=int, default=900)
+    open_cmd.add_argument("--busy-policy", choices=("steer", "wait"), default="steer")
     open_cmd.add_argument("--created-by", default="host")
     open_cmd.set_defaults(func=command_open)
 
@@ -978,6 +1199,7 @@ def build_parser() -> argparse.ArgumentParser:
     adopt_cmd.add_argument("--workspace", default=str(DEFAULT_WORKSPACE))
     adopt_cmd.add_argument("--sandbox", choices=("read-only", "workspace-write"), default="workspace-write")
     adopt_cmd.add_argument("--timeout-seconds", type=int, default=900)
+    adopt_cmd.add_argument("--busy-policy", choices=("steer", "wait"), default="steer")
     adopt_cmd.add_argument("--created-by", default="host")
     adopt_cmd.add_argument("--archive-on-close", action="store_true",
                            help="let 'hub-codex close' archive the adopted thread too")
@@ -998,6 +1220,18 @@ def build_parser() -> argparse.ArgumentParser:
     drain_cmd = sub.add_parser("drain", help="process already queued messages")
     drain_cmd.add_argument("name")
     drain_cmd.set_defaults(func=command_drain)
+
+    watch_cmd = sub.add_parser("watch-turn", help=argparse.SUPPRESS)
+    watch_cmd.add_argument("name")
+    watch_cmd.add_argument("thread_id")
+    watch_cmd.add_argument("turn_id")
+    watch_cmd.add_argument("sender")
+    watch_cmd.add_argument("request_id")
+    watch_cmd.add_argument("hops", type=int)
+    watch_cmd.set_defaults(func=lambda args: int(watch_timed_out_turn(
+        args.name, args.thread_id, None if args.turn_id == "-" else args.turn_id,
+        None if args.sender == "-" else args.sender,
+        None if args.request_id == "-" else args.request_id, args.hops)))
 
     list_cmd = sub.add_parser("list", help="list open Codex slots (and Claude tmux slots)")
     list_cmd.add_argument("--all", action="store_true", help="include closed Codex slots")

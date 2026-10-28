@@ -103,8 +103,12 @@ class FakeDaemon:
                     result = {"thread": {"id": "thread-fake", "status": {"type": "active" if self.busy else "idle"}}}
                 elif method == "thread/read":
                     result = {"thread": {"id": "thread-fake", "name": "slot-test"}}
+                elif method == "thread/turns/list":
+                    result = {"data": [{"id": "turn-fake", "status": "inProgress"}], "nextCursor": "next-page"}
                 elif method == "thread/list":
                     result = {"threads": [{"id": "thread-fake"}]}
+                elif method == "turn/start":
+                    result = {"turn": {"id": "turn-fake", "status": "inProgress"}}
                 else:
                     result = {}
                 send_frame(conn, {"jsonrpc": "2.0", "id": rid, "result": result})
@@ -161,6 +165,35 @@ class CodexDaemonTests(unittest.TestCase):
             finally:
                 client.close()
         self.with_daemon(run)
+
+    def test_inject_turn_uses_expected_turn_id_and_list_turns_views(self):
+        def run(path, server):
+            client = daemon.connect_daemon(path)
+            try:
+                self.assertEqual(client.inject_turn("thread-fake", "new information"), "turn-fake")
+                page = client.list_turns("thread-fake", items_view="notLoaded", limit=10, cursor="cursor-2")
+                self.assertEqual(page["data"][0]["id"], "turn-fake")
+                steer = next(call for call in server.calls if call["method"] == "turn/steer")
+                self.assertEqual(steer["params"]["expectedTurnId"], "turn-fake")
+                self.assertEqual(steer["params"]["input"][0]["text"], "new information")
+                listing = next(call for call in server.calls if call["method"] == "thread/turns/list"
+                               and call["params"].get("cursor") == "cursor-2")
+                self.assertEqual(listing["params"], {"threadId": "thread-fake", "limit": 10,
+                                                     "itemsView": "notLoaded", "cursor": "cursor-2"})
+            finally:
+                client.close()
+        self.with_daemon(run)
+
+    def test_run_turn_timeout_preserves_daemon_turn_id(self):
+        client = daemon.CodexDaemon.__new__(daemon.CodexDaemon)
+        client.is_busy = lambda _thread_id: False
+        client.request = lambda _method, _params: {"result": {"turn": {"id": "turn-timeout"}}}
+        client.request_event = lambda _timeout: (_ for _ in ()).throw(socket.timeout())
+        client.next_id = 0
+        with self.assertRaises(daemon.TurnTimeout) as caught:
+            client.run_turn("thread-fake", "work", timeout=1)
+        self.assertEqual(caught.exception.turn_id, "turn-timeout")
+        self.assertEqual(caught.exception.thread_id, "thread-fake")
 
     def test_busy_thread_raises_thread_busy_without_starting_a_turn(self):
         def run(path, server):
