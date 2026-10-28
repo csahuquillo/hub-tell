@@ -40,7 +40,15 @@ class CodexDaemonError(RuntimeError):
 
 
 class ThreadBusy(CodexDaemonError):
-    """The thread already has a turn running; the message must wait in the queue."""
+    """The thread already has a turn running; the message must wait or be steered."""
+
+
+class TurnTimeout(CodexDaemonError):
+    def __init__(self, thread_id: str, turn_id: str | None, partial_text: str = ""):
+        super().__init__(f"timeout waiting for the turn on {thread_id}")
+        self.thread_id = thread_id
+        self.turn_id = turn_id
+        self.partial_text = partial_text
 
 
 class JSONRPCError(CodexDaemonError):
@@ -260,14 +268,41 @@ class CodexDaemon:
         status = result.get("result", {}).get("thread", {}).get("status") or {}
         return status.get("type") == "active"
 
+    def active_turn_id(self, thread_id: str) -> str | None:
+        result = self.request("thread/turns/list", {"threadId": thread_id, "limit": 3})
+        for turn in result.get("result", {}).get("data", []) or []:
+            if turn.get("status") == "inProgress":
+                return turn.get("id")
+        return None
+
+    def inject_turn(self, thread_id: str, text: str) -> str | None:
+        """Steer the active turn; return None if the thread became idle."""
+        turn_id = self.active_turn_id(thread_id)
+        if not turn_id:
+            return None
+        self.request("turn/steer", {"threadId": thread_id, "expectedTurnId": turn_id,
+                                     "input": [{"type": "text", "text": text}]})
+        return turn_id
+
+    def list_turns(self, thread_id: str, *, items_view: str = "notLoaded",
+                   limit: int = 10, cursor: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"threadId": thread_id, "itemsView": items_view, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        return self.request("thread/turns/list", params).get("result", {})
+
     def run_turn(self, thread_id: str, text: str, timeout: float = 900) -> str:
         if self.is_busy(thread_id):
             raise ThreadBusy(thread_id)
-        self.request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": text}]})
+        started = self.request("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": text}]})
+        turn_id = (started.get("result", {}).get("turn") or {}).get("id")
         deadline = time.monotonic() + timeout
         final = ""
         while time.monotonic() < deadline:
-            event = self.request_event(max(0.1, deadline - time.monotonic()))
+            try:
+                event = self.request_event(max(0.1, deadline - time.monotonic()))
+            except (socket.timeout, TimeoutError):
+                break
             method = event.get("method")
             if method == "turn/completed":
                 turn = event.get("params", {}).get("turn", {})
@@ -281,7 +316,7 @@ class CodexDaemon:
                 item = event.get("params", {}).get("item", {})
                 if item.get("type") == "agentMessage":
                     final = item.get("text", final)
-        raise CodexDaemonError(f"timeout waiting for the turn on {thread_id}")
+        raise TurnTimeout(thread_id, turn_id, final)
 
     def read_thread(self, thread_id: str) -> dict[str, Any]:
         return self.request("thread/read", {"threadId": thread_id}).get("result", {})

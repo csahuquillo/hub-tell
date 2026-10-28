@@ -294,9 +294,12 @@ answer goes back to the sender automatically — no `hub-tell` needed.
 ### Busy threads
 
 If a slot's thread already has a turn running (typically because you are
-using it in Codex Desktop), hub-codex does not start a second turn on top: the
-envelope is **deferred** for 60 seconds and the relay retries it. Meanwhile
-the thread can read it with `hub-bus inbox codex:slot-<name>`.
+using it in Codex Desktop), the default `busy_policy=steer` injects the message
+into that active turn with `turn/steer`. If the daemon cannot inject it, the
+message is queued or deferred for retry. Set `--busy-policy wait` on `open` or
+`adopt` to always defer instead. A turn that exceeds its foreground timeout
+stays acknowledged while a detached watcher waits up to three hours for its
+final result and replies to the original sender.
 
 ### Claims
 
@@ -332,10 +335,10 @@ hub-tell [-f|--force] <slot|codex:slot> <message>
 
 | Command | What it does |
 |---|---|
-| `open slot-<n> [--workspace D] [--sandbox read-only\|workspace-write] [--timeout-seconds N]` | Create a slot and its visible thread. |
-| `adopt slot-<n> [--thread-id ID] [--archive-on-close]` | Register an existing thread as a slot. |
+| `open slot-<n> [--workspace D] [--sandbox read-only\|workspace-write] [--timeout-seconds N] [--busy-policy steer\|wait]` | Create a slot and its visible thread. |
+| `adopt slot-<n> [--thread-id ID] [--archive-on-close] [--busy-policy steer\|wait]` | Register an existing thread as a slot. |
 | `dispatch <slot> <msg> --from <id> [--request-id ID] [--hops N] [--no-reply]` | Start a turn in the background; returns at once. |
-| `send <slot> <msg>` / `tell <slot> <msg> --from <id>` | Run a turn in the foreground (queued if busy). |
+| `send <slot> <msg>` / `tell <slot> <msg> --from <id>` | Run a turn in the foreground, steer an active turn, or queue if injection fails. |
 | `drain <slot>` | Process queued messages. |
 | `list [--all] [--json]`, `status <slot>`, `read <slot>` | Inspect. |
 | `close <slot>` | Close; archives the thread unless it was adopted. |
@@ -410,8 +413,8 @@ Short version (details in [docs/SECURITY.md](docs/SECURITY.md)):
 - **The Codex App Server daemon is experimental**; method names
   (`thread/start`, `thread/resume`, `turn/start`...) and the thread registry
   file used for prefix lookup may change between Codex versions.
-- **Busy threads defer**: a message to a thread you are using waits (60 s
-  retries) until the thread is idle.
+- **Busy threads**: by default, messages are steered into the active turn;
+  `busy_policy=wait` defers them for 60 s retries until the thread is idle.
 - **Sandboxed Codex turns**: turns run with no network and limited write
   access. Their final answer always gets back (hub-codex delivers it from
   outside the sandbox), but running `hub-tell` *from inside* a turn only

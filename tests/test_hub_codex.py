@@ -44,6 +44,10 @@ def fake_daemon_module(calls, *, reply="RESULT: COMPLETED\nSLOT_READY", busy_on_
         def is_busy(self, thread_id):
             return False
 
+        def inject_turn(self, thread_id, text):
+            calls.append(("inject", thread_id, text))
+            return "turn-active"
+
         def run_turn(self, thread_id, text, timeout):
             calls.append(("turn", thread_id, text, timeout))
             if busy_on_turn:
@@ -105,6 +109,7 @@ class TurnTests(StateTestCase):
         self.assertEqual(state["transport"], "daemon")
         self.assertEqual(state["thread_id"], "thread-visible")
         self.assertEqual(state["turn_count"], 1)
+        self.assertEqual(state["busy_policy"], "steer")
         create = next(c for c in calls if c[0] == "create")
         self.assertEqual(create, ("create", "slot-reviewer", str(ROOT.resolve()), "read-only"))
         turn = next(c for c in calls if c[0] == "turn")
@@ -120,16 +125,30 @@ class TurnTests(StateTestCase):
             hub_codex.run_turn("slot-a", hub_codex.load_state("slot-a"), "hi", None)
         self.assertEqual(next(c for c in calls if c[0] == "create")[2], "/srv/projects/hub")
 
-    def test_busy_thread_defers_instead_of_starting_a_turn(self):
-        runs = []
-        state = {"name": "slot-busy", "thread_id": "thread-x", "turn_count": 3}
-        self.make_slot("slot-busy", thread_id="thread-x", turn_count=3)
+    def test_busy_thread_is_steered_by_default(self):
+        calls = []
+        state = self.make_slot("slot-busy", thread_id="thread-x", turn_count=3)
+        state = hub_codex.load_state("slot-busy")
         with mock.patch.object(hub_codex, "daemon_thread_busy", return_value=True), \
-             mock.patch.object(hub_codex.subprocess, "run", side_effect=lambda cmd, **kw: runs.append(cmd)):
+             mock.patch.object(hub_codex, "daemon_module", return_value=fake_daemon_module(calls)), \
+             mock.patch.object(hub_codex, "update_bus") as update, \
+             mock.patch.object(hub_codex.subprocess, "run") as run:
             self.assertEqual(hub_codex.run_turn("slot-busy", state, "hello", "claude:api", True, "1793-abc", 0), 0)
+        self.assertTrue(any(call[0] == "inject" for call in calls))
+        update.assert_called_once_with("1793-abc", "complete", "slot-busy", "Injected into active turn turn-active")
+        run.assert_not_called()
+        self.assertEqual(state["turn_count"], 3)
+
+    def test_busy_policy_wait_defers_instead_of_steering(self):
+        runs = []
+        self.make_slot("slot-wait", thread_id="thread-x", turn_count=3, busy_policy="wait")
+        state = hub_codex.load_state("slot-wait")
+        with mock.patch.object(hub_codex, "daemon_thread_busy", return_value=True), \
+             mock.patch.object(hub_codex, "daemon_module", side_effect=AssertionError("should not steer")), \
+             mock.patch.object(hub_codex.subprocess, "run", side_effect=lambda cmd, **kw: runs.append(cmd)):
+            self.assertEqual(hub_codex.run_turn("slot-wait", state, "hello", "claude:api", True, "1793-abc", 0), 0)
         self.assertEqual(runs[0][1:4], ["defer", "1793-abc", "--by"])
         self.assertEqual(state["turn_count"], 3)
-        self.assertNotEqual(state.get("status"), "working")
 
     def test_thread_busy_race_during_turn_also_defers(self):
         calls, runs = [], []
@@ -139,10 +158,124 @@ class TurnTests(StateTestCase):
              mock.patch.object(hub_codex, "daemon_module", return_value=fake_daemon_module(calls, busy_on_turn=True)), \
              mock.patch.object(hub_codex.subprocess, "run", side_effect=lambda cmd, **kw: runs.append(cmd)):
             self.assertEqual(hub_codex.run_turn("slot-race", state, "hi", "claude:api", True, "req-9", 0), 0)
-        self.assertTrue(any(cmd[1] == "defer" for cmd in runs))
+        self.assertTrue(any(call[0] == "inject" for call in calls))
+        self.assertEqual(runs, [])
         stored = hub_codex.load_state("slot-race")
         self.assertEqual(stored["status"], "idle")
         self.assertNotIn("active_turn", stored)
+
+    def test_command_send_steers_before_queueing_when_slot_lock_is_held(self):
+        self.make_slot("slot-lock-busy", thread_id="thread-x", status="working")
+        state = hub_codex.load_state("slot-lock-busy")
+        lock = mock.Mock()
+        args = self.args(name="slot-lock-busy", message="new info", sender="claude:docs",
+                         no_reply=False, request_id="req-lock", hops=0)
+        with mock.patch.object(hub_codex, "resolve_existing", return_value="slot-lock-busy"), \
+             mock.patch.object(hub_codex, "load_state", return_value=state), \
+             mock.patch.object(hub_codex, "open_lock", return_value=lock), \
+             mock.patch.object(hub_codex.fcntl, "flock", side_effect=BlockingIOError), \
+             mock.patch.object(hub_codex, "daemon_thread_busy", return_value=True), \
+             mock.patch.object(hub_codex, "steer_turn", return_value=True) as steer, \
+             mock.patch.object(hub_codex, "queue_message") as queue, \
+             mock.patch.object(hub_codex, "spawn_drain") as spawn, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(hub_codex.command_send(args), 0)
+        steer.assert_called_once_with("slot-lock-busy", state, "new info", "claude:docs", "req-lock")
+        queue.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_timeout_keeps_bus_ack_and_starts_watcher_without_defer(self):
+        self.make_slot("slot-timeout", thread_id="thread-x", timeout_seconds=1)
+        state = hub_codex.load_state("slot-timeout")
+        class TurnTimeout(Exception):
+            turn_id = "turn-55"
+        module = fake_daemon_module([])
+        module.TurnTimeout = TurnTimeout
+        module.CodexDaemon.run_turn = lambda *_args: (_ for _ in ()).throw(TurnTimeout())
+        bus_updates, replies = [], []
+        with mock.patch.object(hub_codex, "daemon_thread_busy", return_value=False), \
+             mock.patch.object(hub_codex, "daemon_module", return_value=module), \
+             mock.patch.object(hub_codex, "update_bus", side_effect=lambda *a: bus_updates.append(a)), \
+             mock.patch.object(hub_codex, "deliver_reply", side_effect=lambda *a, **k: replies.append((a, k))), \
+             mock.patch.object(hub_codex, "start_turn_watcher") as watcher, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(hub_codex.run_turn("slot-timeout", state, "do it", "claude:docs", True,
+                                                "req-timeout", 2), 0)
+        self.assertEqual(bus_updates, [("req-timeout", "ack", "slot-timeout")])
+        self.assertEqual(state["status"], "working")
+        self.assertTrue(state["active_turn"]["timeout_waiting"])
+        self.assertEqual(replies[0][1]["outcome"], "working")
+        watcher.assert_called_once_with("slot-timeout", "thread-x", "turn-55", "claude:docs", "req-timeout", 2)
+
+    def test_timeout_without_turn_id_does_not_start_watcher_or_defer(self):
+        self.make_slot("slot-untracked", thread_id="thread-x", timeout_seconds=1)
+        state = hub_codex.load_state("slot-untracked")
+        class TurnTimeout(Exception):
+            turn_id = None
+        module = fake_daemon_module([])
+        module.TurnTimeout = TurnTimeout
+        module.CodexDaemon.run_turn = lambda *_args: (_ for _ in ()).throw(TurnTimeout())
+        events, bus_updates = [], []
+        with mock.patch.object(hub_codex, "daemon_thread_busy", return_value=False), \
+             mock.patch.object(hub_codex, "daemon_module", return_value=module), \
+             mock.patch.object(hub_codex, "record_state_change", side_effect=lambda _n, _s, event, **_k: events.append(event)), \
+             mock.patch.object(hub_codex, "update_bus", side_effect=lambda *a: bus_updates.append(a)), \
+             mock.patch.object(hub_codex, "start_turn_watcher") as watcher, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(hub_codex.run_turn("slot-untracked", state, "do it", "claude:docs", True,
+                                                "req-untracked", 0), 0)
+        self.assertIn("turn.timeout-untracked", events)
+        self.assertEqual(bus_updates, [("req-untracked", "ack", "slot-untracked")])
+        watcher.assert_not_called()
+
+    def test_watcher_paginates_not_loaded_then_reads_full_without_read_thread(self):
+        self.make_slot("slot-watch", thread_id="thread-x", status="working",
+                       active_turn={"timeout_waiting": True, "daemon_turn_id": "turn-target", "sequence": 2})
+        state = hub_codex.load_state("slot-watch")
+        calls, replies = [], []
+        class FakeClient:
+            def __init__(self, **_kwargs): pass
+            def initialize(self): pass
+            def list_turns(self, thread_id, *, items_view, limit, cursor):
+                calls.append((items_view, limit, cursor))
+                if items_view == "notLoaded" and cursor is None:
+                    return {"data": [{"id": "unrelated", "status": "inProgress"}], "nextCursor": "poll-next"}
+                if items_view == "notLoaded":
+                    return {"data": [{"id": "turn-target", "status": "completed"}]}
+                if cursor is None:
+                    return {"data": [], "nextCursor": "full-next"}
+                return {"data": [{"id": "turn-target", "status": "completed", "items": [
+                    {"type": "agentMessage", "text": "RESULT: COMPLETED\nDone"}]}]}
+            def read_thread(self, *_args): raise AssertionError("thread/read must never be called")
+            def close(self): pass
+        with mock.patch.object(hub_codex, "daemon_module", return_value=types.SimpleNamespace(CodexDaemon=FakeClient)), \
+             mock.patch.object(hub_codex, "deliver_reply", side_effect=lambda *a, **k: replies.append((a, k))), \
+             mock.patch.object(hub_codex, "update_bus"), \
+             mock.patch.object(hub_codex, "time") as clock:
+            clock.monotonic.side_effect = [0, 0, 0, 0]
+            clock.sleep.return_value = None
+            self.assertTrue(hub_codex.watch_timed_out_turn("slot-watch", "thread-x", "turn-target",
+                                                           "claude:docs", "req-watch", 4,
+                                                           timeout_seconds=10, poll_seconds=0))
+        self.assertEqual(calls, [("notLoaded", 10, None), ("notLoaded", 10, "poll-next"),
+                                 ("full", 10, None), ("full", 10, "full-next")])
+        self.assertEqual(replies[0][0][2], "RESULT: COMPLETED\nDone")
+        self.assertEqual(replies[0][1]["request_id"], "req-watch")
+
+    def test_drain_marks_old_items_and_groups_same_sender(self):
+        self.make_slot("slot-drain")
+        old = (hub_codex.dt.datetime.now(hub_codex.dt.timezone.utc) - hub_codex.dt.timedelta(minutes=8)).isoformat()
+        items = [{"at": old, "prompt": "first", "sender": "claude:docs", "request_id": "req-1"},
+                 {"at": old, "prompt": "second", "sender": "claude:docs", "request_id": "req-2"}]
+        hub_codex.queue_path("slot-drain").write_text("\n".join(json.dumps(item) for item in items) + "\n")
+        seen, updates = [], []
+        with mock.patch.object(hub_codex, "run_turn", side_effect=lambda _n, _s, prompt, *_a: seen.append(prompt) or 0), \
+             mock.patch.object(hub_codex, "update_bus", side_effect=lambda *a: updates.append(a)):
+            self.assertEqual(hub_codex.drain("slot-drain", hub_codex.load_state("slot-drain")), 0)
+        self.assertEqual(len(seen), 1)
+        self.assertRegex(seen[0], r"\[queued [3-9][0-9]* min ago — may be outdated\]")
+        self.assertLess(seen[0].index("first"), seen[0].index("second"))
+        self.assertTrue(any(call[:2] == ("req-2", "complete") for call in updates))
 
     def test_hop_limit_stops_before_starting_a_turn(self):
         sent = []
@@ -207,7 +340,7 @@ class TurnTests(StateTestCase):
         seen = []
         with mock.patch.object(hub_codex, "run_turn", side_effect=lambda _n, _s, prompt, *a: seen.append(prompt) or 0):
             self.assertEqual(hub_codex.drain("slot-drain", hub_codex.load_state("slot-drain")), 0)
-        self.assertEqual(seen, ["first", "second"])
+        self.assertEqual(seen, ["first\n\n---\n\nsecond"])
         self.assertFalse(pending.exists())
 
     def test_terminal_outcome_uses_explicit_contract_only(self):

@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-10-28
+
+### Added
+
+- Active-turn steering for busy Codex threads (`busy_policy=steer` by default),
+  with an opt-in `--busy-policy wait` mode.
+- Detached recovery for foreground turn timeouts. The watcher polls paginated
+  `thread/turns/list` metadata, loads final items only after the turn is
+  terminal, and sends one correlated reply without reading the whole thread.
+- Queue age notices and same-sender batching during drain.
+
+### Fixed
+
+- Messages arriving while a slot lock is held are steered immediately when the
+  daemon confirms the thread is active; they are queued only when injection
+  cannot be completed.
+- Timed-out turns remain acknowledged rather than being deferred or reported as
+  failed, and a timeout with no turn ID never attaches its watcher to another
+  turn.
+
 ## [2.0.0] - 2026-10-27
 
 Dynamic Claude ↔ Codex messaging: questions to Codex become turns in
