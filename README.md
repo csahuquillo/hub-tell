@@ -328,6 +328,12 @@ hub-tell [-f|--force] <slot|codex:slot> <message>
   matching). Refuses to type over a real unsent draft (`-f` overrides).
 - Codex target: records a `hub-bus` envelope, dispatches through `hub-codex`,
   marks it delivered. Fails loudly if the slot does not exist or is closed.
+- Claude target from a sandboxed Codex turn (for example one started from Codex
+  Desktop, where connecting to the tmux socket fails with `Operation not
+  permitted`): if the slot has a hub-bridge channel
+  (`$HUB_BRIDGE_STATE/<slot>.sock`), the message is queued as a `hub-bus`
+  envelope to `claude:<slot>` and `hub-bus-relay`, which runs outside the
+  sandbox, delivers it through the channel. Without a channel it fails as before.
 - Empty messages are rejected; newlines are collapsed to spaces.
 - Log: `${XDG_STATE_HOME:-~/.local/state}/hub-tell/hub-tell.log`.
 

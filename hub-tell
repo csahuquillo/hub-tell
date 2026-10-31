@@ -171,6 +171,22 @@ TMUX_SESSION="=${SESSION}"
 TARGET_PANE="${TMUX_SESSION}:"
 
 if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  # A Codex turn started from Codex Desktop runs in a sandbox that cannot
+  # connect to Unix sockets ("error connecting to /tmp/tmux-<uid>/default
+  # (Operation not permitted)"). If the Claude slot has a hub-bridge channel,
+  # queue the message on the bus: hub-bus-relay runs outside the sandbox and
+  # delivers it through the channel within seconds.
+  BRIDGE_SOCKET="${HUB_BRIDGE_STATE:-$HOME/.local/state/hub-bridge}/${TARGET}.sock"
+  if [ -n "${CODEX_THREAD_ID:-}" ] && [ -S "$BRIDGE_SOCKET" ] && [ -x "$HUB_BUS" ]; then
+    FROM="$(resolve_from)"
+    REQUEST_ID="$("$HUB_BUS" send "claude:${TARGET}" "$MSG" --from "$FROM" --type result)" || {
+      echo "ERROR: tmux is not reachable from this sandbox and the message could not be queued for claude:${TARGET}." >&2
+      exit 1
+    }
+    log_line "FROM=$FROM TO=$SESSION REQUEST_ID=$REQUEST_ID VIA=bus MSG=$MSG"
+    echo "Queued for ${SESSION} as ${REQUEST_ID} (hub-bus-relay delivers it)."
+    exit 0
+  fi
   echo "ERROR: there is no session named exactly '$SESSION' (is slot '$TARGET' open? names are case-sensitive)." >&2
   exit 1
 fi

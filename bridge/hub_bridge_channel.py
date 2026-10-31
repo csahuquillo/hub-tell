@@ -190,7 +190,7 @@ def main():
             emit({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": request.get("params", {}).get("protocolVersion", "2025-06-18"),
                 "capabilities": {"experimental": {"claude/channel": {}}, "tools": {}},
-                "serverInfo": {"name": "hub-bridge", "version": "2.1.0"},
+                "serverInfo": {"name": "hub-bridge", "version": "2.1.1"},
                 "instructions": INSTRUCTIONS}})
         elif method == "notifications/initialized":
             pass

@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] - 2026-10-31
+
+### Fixed
+
+- `hub-tell <claude-slot>` from a sandboxed Codex turn (e.g. started from Codex
+  Desktop) failed with "there is no session named exactly ..." because the
+  sandbox blocks Unix-socket connections to tmux. When tmux is unreachable,
+  `CODEX_THREAD_ID` is set and the target slot has a hub-bridge channel socket,
+  the message is now queued on `hub-bus` for `claude:<slot>` and delivered by
+  `hub-bus-relay` through the channel.
+
 ## [2.1.0] - 2026-10-28
 
 ### Added

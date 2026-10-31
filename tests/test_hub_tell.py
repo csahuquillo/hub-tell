@@ -2,6 +2,7 @@
 """Safety tests for the hub-tell launcher, using a fake tmux, hub-codex and hub-bus."""
 
 import os
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -44,7 +45,7 @@ class HubTellTests(unittest.TestCase):
     def run_tell(self, *args, env=None):
         base = {key: value for key, value in os.environ.items()
                 if key not in {"CODEX_THREAD_ID", "HUB_TELL_FROM", "TMUX", "TMUX_PANE", "HUB_CODEX_COMMAND",
-                               "HUB_BUS_COMMAND", "HUB_CODEX_STATE"}}
+                               "HUB_BUS_COMMAND", "HUB_CODEX_STATE", "HUB_BRIDGE_STATE"}}
         base.update({
             "PATH": f"{self.bin}:{os.environ['PATH']}", "HOME": str(self.root),
             "HUB_TELL_TEST_LOG": str(self.log), "FAKE_PANE": str(self.pane), "FAKE_SESSION": "",
@@ -177,6 +178,35 @@ class HubTellTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 2)
         self.assertIn("NOT delivered", completed.stderr)
         self.assertTrue(any(row.startswith("fail req-7 --by claude:api") for row in bus_log.read_text().splitlines()))
+
+    # -- sandboxed Codex turn without tmux access ------------------------------------
+
+    def sandboxed_codex_env(self, bus):
+        codex = self.script("hub-codex", "#!/bin/sh\n[ \"$1\" = resolve-thread ] && echo codex:slot-reviewer\n")
+        return {"FAKE_TMUX_RC": "1", "CODEX_THREAD_ID": "0199abcd-ef01-7000-8000-000000000000",
+                "HUB_CODEX_COMMAND": str(codex), "HUB_BUS_COMMAND": str(bus),
+                "HUB_BRIDGE_STATE": str(self.root / "bridge"), "BUS_TEST_LOG": str(self.root / "bus.log")}
+
+    def test_sandboxed_codex_queues_claude_message_on_the_bus(self):
+        bridge = self.root / "bridge"
+        bridge.mkdir()
+        channel = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(channel.close)
+        channel.bind(str(bridge / "docs.sock"))
+        bus = self.script("hub-bus", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BUS_TEST_LOG\"\necho req-9\n")
+        completed, tmux_log = self.run_tell("docs", "line 1\nline 2", env=self.sandboxed_codex_env(bus))
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Queued for slot-docs as req-9", completed.stdout)
+        self.assertEqual((self.root / "bus.log").read_text().splitlines(),
+                         ["send claude:docs line 1 line 2 --from codex:slot-reviewer --type result"])
+        self.assertNotIn("send-keys", tmux_log)
+
+    def test_sandboxed_codex_without_channel_still_fails(self):
+        bus = self.script("hub-bus", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$BUS_TEST_LOG\"\necho req-9\n")
+        completed, _ = self.run_tell("ghost", "result", env=self.sandboxed_codex_env(bus))
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("no session named exactly 'slot-ghost'", completed.stderr)
+        self.assertFalse((self.root / "bus.log").exists())
 
     def test_force_is_rejected_for_codex_targets(self):
         completed, _ = self.run_tell("-f", "codex:reviewer", "task")
